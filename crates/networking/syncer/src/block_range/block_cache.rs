@@ -151,14 +151,14 @@ impl BlockCache {
         self.block_ranges_to_retry.push(range);
     }
 
-    pub fn data_to_fetch(&mut self, finalized_slot: u64, current_epoch: u64) -> DataToFetch {
+    pub fn data_to_fetch(&mut self, target_slot: u64, current_epoch: u64) -> DataToFetch {
         match self.block_ranges_to_retry.pop() {
             Some(range) => return DataToFetch::BlockRange(range),
             None => {
                 let estimated_blocks_to_fetch = self.estimated_blocks_to_fetch();
-                if estimated_blocks_to_fetch > 0 && self.next_start_slot < finalized_slot {
+                if estimated_blocks_to_fetch > 0 && self.next_start_slot < target_slot {
                     let blocks_to_fill = estimated_blocks_to_fetch
-                        .min(MAX_BLOCKS_PER_REQUEST.min(finalized_slot - self.next_start_slot));
+                        .min(MAX_BLOCKS_PER_REQUEST.min(target_slot - self.next_start_slot));
                     let start_slot = self.next_start_slot + 1;
                     self.next_start_slot += blocks_to_fill;
                     return DataToFetch::BlockRange(Range::new(start_slot, blocks_to_fill));
@@ -293,7 +293,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_to_fetch_finishes_at_finalized_slot() {
+    fn data_to_fetch_finishes_at_target_slot() {
         initialize_test_network_spec();
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_fetching_uses_the_data_availability_retention_boundary() {
+    fn post_fulu_blob_commitments_never_request_legacy_blob_identifiers() {
         initialize_test_network_spec();
         let network_spec = beacon_network_spec();
         let current_epoch = network_spec.fulu_fork_epoch
@@ -350,10 +350,10 @@ mod tests {
         retained
             .add_blocks(vec![block_with_blob(boundary_slot)], false)
             .expect("boundary block should enter cache");
-        assert!(matches!(
+        assert_eq!(
             retained.data_to_fetch(boundary_slot, current_epoch),
-            DataToFetch::MissingBlobIdentifiers(identifiers) if identifiers.len() == 1
-        ));
+            DataToFetch::Finished
+        );
 
         let expired_slot = compute_start_slot_at_epoch(boundary_epoch - 1);
         let mut expired = BlockCache::new(parent_root, expired_slot);

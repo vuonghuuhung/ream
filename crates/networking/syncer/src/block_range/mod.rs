@@ -43,12 +43,14 @@ const MAX_BLOCKS_PER_REQUEST: u64 = 10;
 const SLEEP_DURATION: Duration = Duration::from_secs(5);
 
 /// Validates downloaded blob sidecars and derives the columns needed for data availability.
+/// An empty `blob_sidecars` map defers to the block-lookup coordinator instead of erroring,
+/// since range sync never fetches legacy blob sidecars for post-Fulu blocks.
 fn build_data_columns_from_blob_sidecars(
     block: &SignedBeaconBlock,
     blob_sidecars: &std::collections::HashMap<BlobIdentifier, BlobSidecar>,
     verify_data_availability: bool,
 ) -> anyhow::Result<Vec<DataColumnSidecar>> {
-    if !verify_data_availability {
+    if !verify_data_availability || blob_sidecars.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -118,8 +120,11 @@ impl BlockRangeSyncer {
         }
     }
 
-    pub async fn is_synced_to_finalized_slot(&self) -> bool {
-        let finalized_slot = self.peer_manager.finalized_slot();
+    pub async fn is_synced_to_head_slot(&self) -> bool {
+        let target_slot = self
+            .peer_manager
+            .head_slot()
+            .or_else(|| self.peer_manager.finalized_slot());
         let latest_synced_slot = self
             .beacon_chain
             .store
@@ -131,7 +136,7 @@ impl BlockRangeSyncer {
             .unwrap_or_default()
             .unwrap_or(0);
 
-        finalized_slot <= Some(latest_synced_slot)
+        target_slot <= Some(latest_synced_slot)
     }
 
     pub fn start(mut self) -> JoinHandle<anyhow::Result<anyhow::Result<BlockRangeSyncer>>> {
@@ -170,10 +175,14 @@ impl BlockRangeSyncer {
             loop {
                 poll_ready_tasks(&mut task_handles, &mut block_cache, &mut self.peer_manager)?;
 
-                let finalized_slot = match self.peer_manager.finalized_slot() {
-                    Some(finalized_slot) => finalized_slot,
+                let target_slot = match self
+                    .peer_manager
+                    .head_slot()
+                    .or_else(|| self.peer_manager.finalized_slot())
+                {
+                    Some(target_slot) => target_slot,
                     None => {
-                        warn!("No peers available to determine finalized slot, retrying...");
+                        warn!("No peers available to determine sync target, retrying...");
                         sleep(SLEEP_DURATION).await;
                         self.peer_manager.update_peer_set();
                         continue;
@@ -186,7 +195,7 @@ impl BlockRangeSyncer {
                     .lock()
                     .await
                     .get_current_store_epoch()?;
-                let data_to_fetch = block_cache.data_to_fetch(finalized_slot, current_epoch);
+                let data_to_fetch = block_cache.data_to_fetch(target_slot, current_epoch);
                 info!(
                     "Forward sync status: Downloaded Blocks {}, Downloaded Blobs {}/{}, Stage {data_to_fetch}",
                     block_cache.block_count(),
@@ -630,7 +639,11 @@ mod tests {
                 .expect("expired blocks should not require blob sidecars")
                 .is_empty()
         );
-        assert!(build_data_columns_from_blob_sidecars(&block, &HashMap::new(), true).is_err());
+        assert!(
+            build_data_columns_from_blob_sidecars(&block, &HashMap::new(), true)
+                .expect("blocks awaiting column fetch should not error")
+                .is_empty()
+        );
 
         let columns = build_data_columns_from_blob_sidecars(&block, &sidecars, true)
             .expect("valid blobs should produce data columns");
@@ -641,5 +654,12 @@ mod tests {
             .expect("test sidecar should exist")
             .kzg_proof[0] ^= 1;
         assert!(build_data_columns_from_blob_sidecars(&block, &sidecars, true).is_err());
+
+        let wrong_identifier = BlobIdentifier::new(B256::repeat_byte(0xAB), 0);
+        let mismatched = HashMap::from([(
+            wrong_identifier,
+            sidecars.remove(&identifier).expect("sidecar should exist"),
+        )]);
+        assert!(build_data_columns_from_blob_sidecars(&block, &mismatched, true).is_err());
     }
 }

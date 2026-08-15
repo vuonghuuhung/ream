@@ -125,4 +125,12 @@ impl PeerManager {
             .max_by_key(|&(_, count)| count)
             .map(|(slot, _)| slot)
     }
+
+    pub fn head_slot(&self) -> Option<u64> {
+        self.peers
+            .values()
+            .filter_map(|peer| peer.peer.status.as_ref())
+            .map(|status| status.head_slot)
+            .max()
+    }
 }
