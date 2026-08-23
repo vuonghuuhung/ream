@@ -38,8 +38,14 @@ ream-req-resp.workspace = true
 ream-storage.workspace = true
 
 [dev-dependencies]
+discv5.workspace = true
 kzg.workspace = true
+parking_lot.workspace = true
 ream-execution-rpc-types.workspace = true
+ream-operation-pool.workspace = true
+ream-peer.workspace = true
+ream-sync-committee-pool.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

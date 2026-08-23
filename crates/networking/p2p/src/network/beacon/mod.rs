@@ -43,7 +43,9 @@ use ream_req_resp::{
         BeaconRequestMessage, BeaconResponseMessage,
         blob_sidecars::BlobSidecarsByRootV1Request,
         blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request},
-        data_column_sidecars::DataColumnSidecarsByRootV1Request,
+        data_column_sidecars::{
+            DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request,
+        },
         meta_data::GetMetaDataV3,
         ping::Ping,
         status::Status,
@@ -52,6 +54,7 @@ use ream_req_resp::{
     handler::{ReqRespMessageError, ReqRespMessageReceived, RespMessage},
     messages::{RequestMessage, ResponseMessage},
 };
+use ssz_types::VariableList;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::interval,
@@ -359,6 +362,19 @@ impl Network {
                             },
                             P2PRequest::BlobIdentifiers { peer_id, blob_identifiers, callback } => {
                                 if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::BlobSidecarsByRoot(BlobSidecarsByRootV1Request::new(blob_identifiers))) {
+                                    self.callbacks.insert(request_id, callback);
+                                } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
+                                    warn!("Failed to send error response: {err:?}");
+                                }
+                            },
+                            P2PRequest::DataColumnRange { peer_id, start, count, columns, callback } => {
+                                let request = DataColumnSidecarsByRangeV1Request {
+                                    start_slot: start,
+                                    count,
+                                    columns: VariableList::new(columns)
+                                        .expect("Too many columns were requested"),
+                                };
+                                if let Some(request_id) = self.send_request(peer_id, BeaconRequestMessage::DataColumnSidecarsByRange(request)) {
                                     self.callbacks.insert(request_id, callback);
                                 } else if let Err(err) = callback.send(Ok(P2PCallbackResponse::Disconnected)).await {
                                     warn!("Failed to send error response: {err:?}");

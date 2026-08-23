@@ -8,7 +8,8 @@ use alloy_primitives::B256;
 use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_misc::{
-    constants::beacon::NUM_CUSTODY_GROUPS, misc::compute_start_slot_at_epoch,
+    constants::beacon::{NUM_CUSTODY_GROUPS, SLOTS_PER_EPOCH},
+    misc::compute_start_slot_at_epoch,
 };
 use ream_discv5::{
     config::DiscoveryConfig,
@@ -37,7 +38,10 @@ use ream_syncer::{
     block_range::BlockRangeSyncer,
     unknown_parent_lookups::{MAX_LOOKUPS, UnknownBlockMeta, UnknownParentLookupCoordinator},
 };
-use tokio::{sync::mpsc, time::interval};
+use tokio::{
+    sync::mpsc,
+    time::{interval, sleep},
+};
 use tracing::{error, info, warn};
 use tree_hash::TreeHash;
 
@@ -107,6 +111,7 @@ pub struct NetworkManagerService {
     pub ream_db: BeaconDB,
     pub cached_db: Arc<BeaconCacheDB>,
     pub sync_committee_pool: Arc<SyncCommitteePool>,
+    pub executor: ReamExecutor,
 }
 
 struct ReconciledBlockLookupState {
@@ -274,6 +279,7 @@ impl NetworkManagerService {
             ream_db,
             cached_db,
             sync_committee_pool,
+            executor,
         })
     }
 
@@ -290,9 +296,13 @@ impl NetworkManagerService {
             cached_db,
             network_state,
             block_range_syncer,
+            executor,
             ..
         } = self;
 
+        let mut resync_check_interval = interval(Duration::from_secs(
+            SLOTS_PER_EPOCH * beacon_network_spec().seconds_per_slot(),
+        ));
         let mut interval = interval(Duration::from_secs(
             beacon_network_spec().seconds_per_slot(),
         ));
@@ -314,6 +324,8 @@ impl NetworkManagerService {
         let mut syncer_handle = block_range_syncer.start();
         // Avoid polling a completed JoinHandle after the syncer has caught up.
         let mut syncer_active = true;
+        // Kept alive (not dropped) once synced, so the periodic re-check can restart it later.
+        let mut idle_syncer: Option<BlockRangeSyncer> = None;
         loop {
             tokio::select! {
                 // Drive unknown-parent lookup actions and results.
@@ -527,31 +539,43 @@ impl NetworkManagerService {
                 // Restart range sync until the finalized target is reached.
                 result = &mut syncer_handle, if syncer_active => {
                     syncer_active = false;
-                    let joined_result = match result {
-                        Ok(joined_result) => joined_result,
-                        Err(err) => {
-                            error!("Block range syncer failed to join task: {err}");
-                            continue;
+                    match result {
+                        Ok(Ok((block_range_syncer, sync_result))) => {
+                            if let Err(err) = sync_result {
+                                warn!("Block range sync segment failed: {err:?}");
+                            }
+                            if block_range_syncer.is_synced_to_head_slot().await {
+                                idle_syncer = Some(block_range_syncer);
+                            } else {
+                                syncer_handle = block_range_syncer.start();
+                                syncer_active = true;
+                            }
                         }
-                    };
-
-                    let thread_result = match joined_result {
-                        Ok(result) => result,
-                        Err(err) => {
-                            error!("Block range syncer thread failed: {err}");
-                            continue;
+                        Ok(Err(err)) => {
+                            // Executor shutdown cancelled the task; do not re-arm.
+                            error!("Block range syncer task cancelled: {err}");
                         }
-                    };
-
-                    let block_range_syncer = match thread_result {
-                        Ok(syncer) => syncer,
                         Err(err) => {
-                            error!("Block range syncer failed to start: {err}");
-                            continue;
+                            error!("Block range syncer task panicked, reconstructing: {err}");
+                            sleep(Duration::from_secs(5)).await;
+                            let block_range_syncer = BlockRangeSyncer::new(
+                                beacon_chain.clone(),
+                                p2p_sender.0.clone(),
+                                network_state.clone(),
+                                executor.clone(),
+                            );
+                            syncer_handle = block_range_syncer.start();
+                            syncer_active = true;
                         }
-                    };
-
-                    if !block_range_syncer.is_synced_to_head_slot().await {
+                    }
+                }
+                _ = resync_check_interval.tick(), if !syncer_active && idle_syncer.is_some() => {
+                    let block_range_syncer = idle_syncer
+                        .take()
+                        .expect("checked by the select guard above");
+                    if block_range_syncer.is_synced_to_head_slot().await {
+                        idle_syncer = Some(block_range_syncer);
+                    } else {
                         syncer_handle = block_range_syncer.start();
                         syncer_active = true;
                     }

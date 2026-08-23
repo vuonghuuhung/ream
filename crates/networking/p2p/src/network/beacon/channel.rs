@@ -56,6 +56,13 @@ pub enum P2PRequest {
         blob_identifiers: Vec<BlobIdentifier>,
         callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
     },
+    DataColumnRange {
+        peer_id: PeerId,
+        start: u64,
+        count: u64,
+        columns: Vec<u64>,
+        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+    },
     DataColumnIdentifiers {
         peer_id: PeerId,
         column_identifiers: Vec<DataColumnsByRootIdentifier>,
