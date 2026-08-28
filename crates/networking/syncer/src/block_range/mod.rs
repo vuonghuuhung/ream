@@ -7,18 +7,18 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
 use anyhow::{anyhow, bail, ensure};
-use block_cache::{BlockAndBlobBundle, BlockCache, DataToFetch};
+use block_cache::{BlockAndBlobBundle, BlockCache, DataToFetch, RequestKey};
 use futures::task::noop_waker;
 use libp2p::PeerId;
-use peer_manager::{BanReason, PeerManager};
+use peer_manager::{BanReason, MIN_SYNC_PEERS, PeerManager, TargetQualification, TargetSelection};
 use peer_range_downloader::{
-    PeerBlobIdentifierDownloader, PeerDataColumnIdentifierDownloader,
-    PeerDataColumnRangeDownloader, PeerRootsDownloader,
+    DownloadFailure, PeerBlobIdentifierDownloader, PeerDataColumnIdentifierDownloader,
+    PeerDataColumnRangeDownloader, PeerRootsDownloader, StreamOutcome,
 };
 use ream_chain_beacon::beacon_chain::{
     BeaconChain, BlockProcessingOutcome, is_data_availability_check_required,
@@ -31,15 +31,19 @@ use ream_consensus_beacon::{
     electra::beacon_block::SignedBeaconBlock,
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
-use ream_consensus_misc::misc::compute_epoch_at_slot;
+use ream_consensus_misc::{constants::beacon::SLOTS_PER_EPOCH, misc::compute_epoch_at_slot};
 use ream_executor::ReamExecutor;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_polynomial_commitments::handlers::verify_blob_kzg_proof_batch;
 use ream_req_resp::{
     MAX_CONCURRENT_REQUESTS, beacon::messages::data_column_sidecars::DataColumnsByRootIdentifier,
+    inbound_protocol::ResponseCode,
 };
-use ream_storage::tables::table::{CustomTable, REDBTable};
+use ream_storage::tables::{
+    field::REDBField,
+    table::{CustomTable, REDBTable},
+};
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 use tree_hash::TreeHash;
@@ -53,6 +57,10 @@ const SLEEP_DURATION: Duration = Duration::from_secs(5);
 /// Max slots behind wall-clock to still count as synced (like Lighthouse's
 /// `SLOT_IMPORT_TOLERANCE`). A thin/early peer sample can be fooled; the clock can't.
 const SLOT_IMPORT_TOLERANCE: u64 = 32;
+
+const ZERO_PROGRESS_BACKOFF: Duration = Duration::from_secs(30);
+
+const CANDIDATE_EXHAUSTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Validates downloaded blob sidecars and derives the columns needed for data availability.
 /// An empty `blob_sidecars` map defers to the block-lookup coordinator instead of erroring,
@@ -92,6 +100,10 @@ fn build_data_columns_from_blob_sidecars(
             sidecar.kzg_commitment == *expected_commitment,
             "Blob sidecar {index} commitment does not match block {block_root}"
         );
+        ensure!(
+            sidecar.verify_blob_sidecar_inclusion_proof(),
+            "Invalid inclusion proof for blob sidecar {index} of block {block_root}"
+        );
 
         blobs.push(sidecar.blob.clone());
         proofs.push(sidecar.kzg_proof);
@@ -110,11 +122,24 @@ fn build_data_columns_from_blob_sidecars(
         .map_err(|err| anyhow!("Failed to build data columns for block {block_root}: {err}"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncPhase {
+    Finalized,
+    Head,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePhaseTarget {
+    slot: u64,
+    qualification: TargetQualification,
+}
+
 pub struct BlockRangeSyncer {
     pub beacon_chain: Arc<BeaconChain>,
     pub peer_manager: PeerManager,
     pub p2p_sender: UnboundedSender<P2PMessage>,
     pub executor: ReamExecutor,
+    next_segment_not_before: Option<Instant>,
 }
 
 impl BlockRangeSyncer {
@@ -129,13 +154,12 @@ impl BlockRangeSyncer {
             p2p_sender,
             peer_manager: PeerManager::new(network_state),
             executor,
+            next_segment_not_before: None,
         }
     }
 
-    pub async fn is_synced_to_head_slot(&self) -> bool {
-        let Some(sync_target) = self.peer_manager.sync_target() else {
-            return false;
-        };
+    pub async fn is_synced_to_head_slot(&mut self) -> bool {
+        self.peer_manager.update_peer_set();
 
         let store = self.beacon_chain.store.lock().await;
         let latest_synced_slot = store
@@ -144,15 +168,37 @@ impl BlockRangeSyncer {
             .get_highest_slot()
             .unwrap_or_default()
             .unwrap_or(0);
+        let Ok(finalized_epoch) = store.db.finalized_checkpoint_provider().get() else {
+            return false;
+        };
+        let finalized_epoch = finalized_epoch.epoch;
         let Ok(current_slot) = store.get_current_slot() else {
             return false;
         };
         drop(store);
 
-        let peers_report_caught_up = sync_target.slot <= latest_synced_slot;
+        let finalized_selection = self.peer_manager.best_finalized(finalized_epoch);
+        let still_behind_finalized = matches!(
+            &finalized_selection,
+            TargetSelection::Ready { target_slot, .. } if latest_synced_slot < *target_slot
+        );
+        if still_behind_finalized {
+            return false;
+        }
+
+        let our_head_epoch = latest_synced_slot / SLOTS_PER_EPOCH;
+        let head_selection = self
+            .peer_manager
+            .best_non_finalized(MIN_SYNC_PEERS, our_head_epoch);
         // The clock is ground truth peers can't fake.
         let clock_confirms_caught_up =
             current_slot.saturating_sub(latest_synced_slot) <= SLOT_IMPORT_TOLERANCE;
+
+        let TargetSelection::Ready { target_slot, .. } = head_selection else {
+            return clock_confirms_caught_up;
+        };
+
+        let peers_report_caught_up = target_slot <= latest_synced_slot;
 
         peers_report_caught_up && clock_confirms_caught_up
     }
@@ -166,36 +212,49 @@ impl BlockRangeSyncer {
     }
 
     async fn run_segment(&mut self) -> anyhow::Result<()> {
-        let Some(latest_synced_root) = self
-            .beacon_chain
-            .store
-            .lock()
-            .await
-            .db
-            .slot_index_provider()
-            .get_highest_root()
-            .map_err(|err| anyhow!("Failed to get highest root: {err}"))?
-        else {
-            bail!("No synced root found in the database");
-        };
+        if let Some(not_before) = self.next_segment_not_before.take()
+            && let Some(remaining) = not_before.checked_duration_since(Instant::now())
+        {
+            info!("Backing off {remaining:?} after the previous segment made no progress...");
+            sleep(remaining).await;
+        }
 
-        let Some(latest_synced_slot) = self
-            .beacon_chain
-            .store
-            .lock()
-            .await
+        let store = self.beacon_chain.store.lock().await;
+        let head_root = store
+            .get_head()
+            .map_err(|err| anyhow!("Failed to get canonical head: {err}"))?;
+        let head_slot = store
             .db
-            .slot_index_provider()
-            .get_highest_slot()
-            .map_err(|err| anyhow!("Failed to get highest slot: {err}"))?
-        else {
-            bail!("No synced slot found in the database");
-        };
+            .block_provider()
+            .get(head_root)
+            .map_err(|err| anyhow!("Failed to load head block: {err}"))?
+            .ok_or_else(|| anyhow!("Head block {head_root} not found"))?
+            .message
+            .slot;
+        let finalized_epoch = store
+            .db
+            .finalized_checkpoint_provider()
+            .get()
+            .map_err(|err| anyhow!("Failed to get finalized checkpoint: {err}"))?
+            .epoch;
+        drop(store);
+        let our_head_epoch = head_slot / SLOTS_PER_EPOCH;
 
         // phase 1: download majority of blocks from ranges
-        let mut block_cache = BlockCache::new(latest_synced_root, latest_synced_slot);
+        let mut block_cache = BlockCache::new(head_root, head_slot);
         let mut task_handles = vec![];
+
+        let mut phase = SyncPhase::Finalized;
+        let mut active_target: Option<ActivePhaseTarget> = None;
+        let mut saw_empty_range = false;
+        let mut finalized_phase_settled = false;
+        let mut finalized_target_was_ahead = false;
+        let mut candidate_exhausted_since: Option<Instant> = None;
+        let mut ended_due_to_candidate_exhaustion = false;
+
         loop {
+            self.peer_manager.update_peer_set();
+
             let required_columns = self
                 .beacon_chain
                 .store
@@ -205,19 +264,109 @@ impl BlockRangeSyncer {
                 .required_columns()
                 .clone();
 
+            let selection = match phase {
+                SyncPhase::Finalized => self.peer_manager.best_finalized(finalized_epoch),
+                SyncPhase::Head => self
+                    .peer_manager
+                    .best_non_finalized(MIN_SYNC_PEERS, our_head_epoch),
+            };
+
+            if active_target.is_none() {
+                if phase == SyncPhase::Finalized {
+                    match &selection {
+                        TargetSelection::Ready {
+                            target_slot,
+                            eligible_peers,
+                        } => {
+                            if block_cache.next_start_slot() >= *target_slot {
+                                phase = SyncPhase::Head;
+                                continue;
+                            }
+                            if eligible_peers.len() < MIN_SYNC_PEERS {
+                                info!(
+                                    "Finalized target not yet confirmed by enough peers ({} < {MIN_SYNC_PEERS}), waiting...",
+                                    eligible_peers.len()
+                                );
+                                sleep(SLEEP_DURATION).await;
+                                continue;
+                            }
+                        }
+                        TargetSelection::NoQuorum => {
+                            phase = SyncPhase::Head;
+                            continue;
+                        }
+                    }
+                } else if let TargetSelection::NoQuorum = &selection {
+                    if finalized_phase_settled || block_cache.block_count() > 0 {
+                        info!(
+                            "No head-phase sync target after the finalized phase settled; ending this segment."
+                        );
+                        break;
+                    }
+                    info!("No sync target yet, waiting for peers...");
+                    sleep(SLEEP_DURATION).await;
+                    continue;
+                }
+            }
+
+            if let TargetSelection::Ready {
+                target_slot,
+                eligible_peers,
+            } = &selection
+            {
+                let sufficient = match phase {
+                    SyncPhase::Finalized => eligible_peers.len() >= MIN_SYNC_PEERS,
+                    SyncPhase::Head => true,
+                };
+                if sufficient {
+                    let qualification = match phase {
+                        SyncPhase::Finalized => {
+                            TargetQualification::FinalizedEpoch(target_slot / SLOTS_PER_EPOCH)
+                        }
+                        SyncPhase::Head => {
+                            TargetQualification::HeadEpoch(target_slot / SLOTS_PER_EPOCH)
+                        }
+                    };
+                    active_target = Some(match active_target {
+                        Some(existing) if existing.slot > *target_slot => existing,
+                        _ => ActivePhaseTarget {
+                            slot: *target_slot,
+                            qualification,
+                        },
+                    });
+                }
+            }
+
+            let Some(target) = active_target.clone() else {
+                sleep(SLEEP_DURATION).await;
+                continue;
+            };
+
+            let candidate_peers = self.peer_manager.peers_satisfying(target.qualification);
+
+            if candidate_peers.is_empty() {
+                let exhausted_since = *candidate_exhausted_since.get_or_insert_with(Instant::now);
+                if exhausted_since.elapsed() >= CANDIDATE_EXHAUSTION_TIMEOUT {
+                    info!(
+                        "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this segment."
+                    );
+                    ended_due_to_candidate_exhaustion = true;
+                    break;
+                }
+            } else {
+                candidate_exhausted_since = None;
+            }
+
+            let now = Instant::now();
             poll_ready_tasks(
                 &mut task_handles,
                 &mut block_cache,
                 &mut self.peer_manager,
                 &required_columns,
+                &mut saw_empty_range,
+                &candidate_peers,
+                now,
             )?;
-
-            let Some(sync_target) = self.peer_manager.sync_target() else {
-                warn!("No peers available to determine sync target, retrying...");
-                sleep(SLEEP_DURATION).await;
-                self.peer_manager.update_peer_set();
-                continue;
-            };
 
             let current_epoch = self
                 .beacon_chain
@@ -225,8 +374,13 @@ impl BlockRangeSyncer {
                 .lock()
                 .await
                 .get_current_store_epoch()?;
-            let data_to_fetch =
-                block_cache.data_to_fetch(sync_target.slot, current_epoch, &required_columns);
+            let data_to_fetch = block_cache.data_to_fetch(
+                target.slot,
+                current_epoch,
+                &required_columns,
+                &candidate_peers,
+                now,
+            );
             info!(
                 "Forward sync status: Downloaded Blocks {}, Downloaded Blobs {}/{}, Stage {data_to_fetch}",
                 block_cache.block_count(),
@@ -236,9 +390,11 @@ impl BlockRangeSyncer {
 
             match data_to_fetch {
                 DataToFetch::BlockRange(range) => {
+                    let key = RequestKey::BlockRange(range);
+                    let excluded = block_cache.attempted_peers_for(key);
                     let Some(peer) = self
                         .peer_manager
-                        .fetch_idle_peer_preferring(Some(sync_target.root))
+                        .fetch_idle_peer_from_excluding(&candidate_peers, &excluded)
                     else {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for block range sync.");
@@ -260,9 +416,11 @@ impl BlockRangeSyncer {
                     ));
                 }
                 DataToFetch::DataColumnRange(range) => {
+                    let key = RequestKey::ColumnRange(range);
+                    let excluded = block_cache.attempted_peers_for(key);
                     let Some(peer) = self
                         .peer_manager
-                        .fetch_idle_peer_preferring(Some(sync_target.root))
+                        .fetch_idle_peer_from_excluding(&candidate_peers, &excluded)
                     else {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for data column range sync.");
@@ -270,6 +428,9 @@ impl BlockRangeSyncer {
                         sleep(SLEEP_DURATION).await;
                         continue;
                     };
+
+                    let expected_known_identifiers =
+                        block_cache.expected_column_identifiers_in_range(range, &required_columns);
 
                     block_cache.mark_column_range_in_progress(range);
                     task_handles.push(DownloadTask::new_data_column_range(
@@ -282,38 +443,57 @@ impl BlockRangeSyncer {
                         ),
                         range,
                         peer.peer_id,
+                        expected_known_identifiers,
                     ));
                 }
-                DataToFetch::MissingBlockRoots(block_roots) => {
-                    for block_roots_chunk in block_roots.chunks(MAX_CONCURRENT_REQUESTS) {
+                DataToFetch::MissingBlockRoots(mut block_roots) => {
+                    let mut exhausted_this_tick = HashSet::new();
+                    while !block_roots.is_empty() {
                         let Some(peer) = self
                             .peer_manager
-                            .fetch_idle_peer_preferring(Some(sync_target.root))
+                            .fetch_idle_peer_from_excluding(&candidate_peers, &exhausted_this_tick)
                         else {
                             self.peer_manager.update_peer_set();
                             info!("No idle peers available for block roots sync.");
                             sleep(SLEEP_DURATION).await;
                             break;
                         };
-                        block_cache.extend_block_roots_in_progress(block_roots_chunk);
+
+                        let (assigned, remaining): (Vec<B256>, Vec<B256>) =
+                            block_roots.into_iter().partition(|root| {
+                                !block_cache
+                                    .attempted_peers_for(RequestKey::BlockRoot(*root))
+                                    .contains(&peer.peer_id)
+                            });
+                        block_roots = remaining;
+                        if assigned.is_empty() {
+                            self.peer_manager.mark_peer_as_idle(&peer.peer_id);
+                            exhausted_this_tick.insert(peer.peer_id);
+                            continue;
+                        }
+                        let chunk: Vec<B256> =
+                            assigned.into_iter().take(MAX_CONCURRENT_REQUESTS).collect();
+
+                        block_cache.extend_block_roots_in_progress(&chunk);
 
                         task_handles.push(DownloadTask::new_block_roots(
                             PeerRootsDownloader::start(
                                 peer.peer_id,
                                 self.p2p_sender.clone(),
                                 self.executor.clone(),
-                                block_roots_chunk.to_vec(),
+                                chunk.clone(),
                             ),
-                            block_roots_chunk.to_vec(),
+                            chunk,
                             peer.peer_id,
                         ));
                     }
                 }
-                DataToFetch::MissingBlobIdentifiers(blob_identifiers) => {
-                    for blob_identifiers_chunk in blob_identifiers.chunks(MAX_BLOBS_PER_REQUEST) {
+                DataToFetch::MissingBlobIdentifiers(mut blob_identifiers) => {
+                    let mut exhausted_this_tick = HashSet::new();
+                    while !blob_identifiers.is_empty() {
                         let Some(peer) = self
                             .peer_manager
-                            .fetch_idle_peer_preferring(Some(sync_target.root))
+                            .fetch_idle_peer_from_excluding(&candidate_peers, &exhausted_this_tick)
                         else {
                             self.peer_manager.update_peer_set();
                             info!(
@@ -324,25 +504,41 @@ impl BlockRangeSyncer {
                             break;
                         };
 
-                        block_cache.extend_blob_identifiers_in_progress(blob_identifiers_chunk);
+                        let (assigned, remaining): (Vec<BlobIdentifier>, Vec<BlobIdentifier>) =
+                            blob_identifiers.into_iter().partition(|identifier| {
+                                !block_cache
+                                    .attempted_peers_for(RequestKey::Blob(*identifier))
+                                    .contains(&peer.peer_id)
+                            });
+                        blob_identifiers = remaining;
+                        if assigned.is_empty() {
+                            self.peer_manager.mark_peer_as_idle(&peer.peer_id);
+                            exhausted_this_tick.insert(peer.peer_id);
+                            continue;
+                        }
+                        let chunk: Vec<BlobIdentifier> =
+                            assigned.into_iter().take(MAX_BLOBS_PER_REQUEST).collect();
+
+                        block_cache.extend_blob_identifiers_in_progress(&chunk);
 
                         task_handles.push(DownloadTask::new_blob_identifiers(
                             PeerBlobIdentifierDownloader::start(
                                 peer.peer_id,
                                 self.p2p_sender.clone(),
                                 self.executor.clone(),
-                                blob_identifiers_chunk.to_vec(),
+                                chunk.clone(),
                             ),
-                            blob_identifiers_chunk.to_vec(),
+                            chunk,
                             peer.peer_id,
                         ));
                     }
                 }
-                DataToFetch::MissingDataColumnIdentifiers(identifiers) => {
-                    for identifiers_chunk in identifiers.chunks(MAX_CONCURRENT_REQUESTS) {
+                DataToFetch::MissingDataColumnIdentifiers(mut identifiers) => {
+                    let mut exhausted_this_tick = HashSet::new();
+                    while !identifiers.is_empty() {
                         let Some(peer) = self
                             .peer_manager
-                            .fetch_idle_peer_preferring(Some(sync_target.root))
+                            .fetch_idle_peer_from_excluding(&candidate_peers, &exhausted_this_tick)
                         else {
                             self.peer_manager.update_peer_set();
                             info!("No idle peers available for data column sync.");
@@ -350,16 +546,31 @@ impl BlockRangeSyncer {
                             break;
                         };
 
-                        block_cache.extend_data_column_identifiers_in_progress(identifiers_chunk);
+                        let (assigned, remaining): (Vec<ColumnIdentifier>, Vec<ColumnIdentifier>) =
+                            identifiers.into_iter().partition(|identifier| {
+                                !block_cache
+                                    .attempted_peers_for(RequestKey::Column(*identifier))
+                                    .contains(&peer.peer_id)
+                            });
+                        identifiers = remaining;
+                        if assigned.is_empty() {
+                            self.peer_manager.mark_peer_as_idle(&peer.peer_id);
+                            exhausted_this_tick.insert(peer.peer_id);
+                            continue;
+                        }
+                        let chunk: Vec<ColumnIdentifier> =
+                            assigned.into_iter().take(MAX_CONCURRENT_REQUESTS).collect();
+
+                        block_cache.extend_data_column_identifiers_in_progress(&chunk);
 
                         task_handles.push(DownloadTask::new_data_column_identifiers(
                             PeerDataColumnIdentifierDownloader::start(
                                 peer.peer_id,
                                 self.p2p_sender.clone(),
                                 self.executor.clone(),
-                                group_by_block_root(identifiers_chunk),
+                                group_by_block_root(&chunk),
                             ),
-                            identifiers_chunk.to_vec(),
+                            chunk,
                             peer.peer_id,
                         ));
                     }
@@ -371,7 +582,17 @@ impl BlockRangeSyncer {
                     );
                     sleep(Duration::from_secs(10)).await;
                 }
-                DataToFetch::Finished => break,
+                DataToFetch::Finished => {
+                    if phase == SyncPhase::Finalized && block_cache.next_start_slot() >= target.slot
+                    {
+                        finalized_target_was_ahead = target.slot > head_slot;
+                        phase = SyncPhase::Head;
+                        active_target = None;
+                        finalized_phase_settled = true;
+                        continue;
+                    }
+                    break;
+                }
             }
         }
 
@@ -382,6 +603,7 @@ impl BlockRangeSyncer {
         );
 
         let fulu_fork_epoch = beacon_network_spec().fulu_fork_epoch;
+        let mut imported_count: u64 = 0;
 
         // execute all the blocks downloaded
         for BlockAndBlobBundle {
@@ -470,9 +692,21 @@ impl BlockRangeSyncer {
                     );
                 }
             }
+            imported_count += 1;
         }
 
         info!("All blocks processed successfully.");
+
+        let target_was_ahead = finalized_target_was_ahead
+            || active_target
+                .as_ref()
+                .is_some_and(|target| target.slot > head_slot);
+        if target_was_ahead
+            && (saw_empty_range || ended_due_to_candidate_exhaustion)
+            && imported_count == 0
+        {
+            self.next_segment_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
+        }
 
         Ok(())
     }
@@ -502,27 +736,28 @@ fn group_by_block_root(identifiers: &[ColumnIdentifier]) -> Vec<DataColumnsByRoo
 
 pub enum DownloadTask {
     BlockRange {
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<SignedBeaconBlock>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>>,
         range: Range,
         peer_id: PeerId,
     },
     DataColumnRange {
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<DataColumnSidecar>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>>,
         range: Range,
         peer_id: PeerId,
+        expected_known_identifiers: Vec<ColumnIdentifier>,
     },
     BlockRoots {
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<SignedBeaconBlock>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>>,
         roots: Vec<B256>,
         peer_id: PeerId,
     },
     BlobIdentifiers {
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<BlobSidecar>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<BlobSidecar>>>,
         blob_identifiers: Vec<BlobIdentifier>,
         peer_id: PeerId,
     },
     DataColumnIdentifiers {
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<DataColumnSidecar>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>>,
         identifiers: Vec<ColumnIdentifier>,
         peer_id: PeerId,
     },
@@ -530,7 +765,7 @@ pub enum DownloadTask {
 
 impl DownloadTask {
     pub fn new_block_range(
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<SignedBeaconBlock>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>>,
         range: Range,
         peer_id: PeerId,
     ) -> Self {
@@ -542,19 +777,21 @@ impl DownloadTask {
     }
 
     pub fn new_data_column_range(
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<DataColumnSidecar>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>>,
         range: Range,
         peer_id: PeerId,
+        expected_known_identifiers: Vec<ColumnIdentifier>,
     ) -> Self {
         DownloadTask::DataColumnRange {
             handle,
             range,
             peer_id,
+            expected_known_identifiers,
         }
     }
 
     pub fn new_block_roots(
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<SignedBeaconBlock>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>>,
         roots: Vec<B256>,
         peer_id: PeerId,
     ) -> Self {
@@ -566,7 +803,7 @@ impl DownloadTask {
     }
 
     pub fn new_blob_identifiers(
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<BlobSidecar>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<BlobSidecar>>>,
         blob_identifiers: Vec<BlobIdentifier>,
         peer_id: PeerId,
     ) -> Self {
@@ -578,7 +815,7 @@ impl DownloadTask {
     }
 
     pub fn new_data_column_identifiers(
-        handle: JoinHandle<anyhow::Result<anyhow::Result<Vec<DataColumnSidecar>>>>,
+        handle: JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>>,
         identifiers: Vec<ColumnIdentifier>,
         peer_id: PeerId,
     ) -> Self {
@@ -590,11 +827,53 @@ impl DownloadTask {
     }
 }
 
+fn handle_stream_outcome<T>(
+    peer_manager: &mut PeerManager,
+    peer_id: &PeerId,
+    result: Result<anyhow::Result<StreamOutcome<T>>, tokio::task::JoinError>,
+) -> Option<Vec<T>> {
+    let outcome = match result {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err)) => {
+            warn!("Forward fill task failed: {err}");
+            return None;
+        }
+        Err(err) => {
+            warn!("Forward fill task panicked: {err}");
+            return None;
+        }
+    };
+
+    match outcome {
+        StreamOutcome::Complete(items) => Some(items),
+        StreamOutcome::Failed(DownloadFailure::Transport(detail)) => {
+            info!("Transport failure from peer {peer_id}, will retry with someone else: {detail}");
+            None
+        }
+        StreamOutcome::Failed(DownloadFailure::InvalidData(detail)) => {
+            warn!("Invalid data from peer {peer_id}: {detail}");
+            peer_manager.ban_peer(peer_id, BanReason::ProtocolError(detail));
+            None
+        }
+        StreamOutcome::Failed(DownloadFailure::RemoteError { code, message }) => {
+            if code == ResponseCode::InvalidRequest {
+                warn!("Peer {peer_id} reported InvalidRequest (possible local bug): {message}");
+            } else {
+                info!("Peer {peer_id} declined the request ({code:?}): {message}");
+            }
+            None
+        }
+    }
+}
+
 fn poll_ready_tasks(
     tasks: &mut Vec<DownloadTask>,
     block_cache: &mut BlockCache,
     peer_manager: &mut PeerManager,
     required_columns: &HashSet<u64>,
+    saw_empty_range: &mut bool,
+    candidate_peers: &[PeerId],
+    now: Instant,
 ) -> anyhow::Result<()> {
     let waker = noop_waker();
     let mut context = Context::from_waker(&waker);
@@ -615,35 +894,42 @@ fn poll_ready_tasks(
                 let pinned = Pin::new(handle);
 
                 match pinned.poll(&mut context) {
-                    Poll::Ready(Ok(blocks_result)) => {
+                    Poll::Ready(result) => {
                         indexes_to_remove.push(index);
                         block_cache.remove_block_range_in_progress(range);
                         peer_manager.mark_peer_as_idle(peer_id);
-                        let blocks = match blocks_result {
-                            Ok(blocks) => blocks,
-                            Err(err) => {
-                                warn!("Failed to fetch blocks from peer: {err:?}");
-                                block_cache.push_retry_range(*range);
-                                continue;
-                            }
-                        };
+                        let key = RequestKey::BlockRange(*range);
 
-                        let blocks = match blocks {
-                            Ok(blocks) => blocks,
-                            Err(err) => {
-                                block_cache.push_retry_range(*range);
-                                peer_manager.ban_peer(
-                                    peer_id,
-                                    BanReason::ProtocolError(format!("{err:?}")),
-                                );
-                                continue;
-                            }
+                        let Some(blocks) = handle_stream_outcome(peer_manager, peer_id, result)
+                        else {
+                            block_cache.mark_attempted(key, *peer_id, candidate_peers, now);
+                            block_cache.push_retry_range(*range);
+                            continue;
                         };
 
                         if blocks.is_empty() {
-                            warn!("Received empty block range from peer: {peer_id}");
+                            info!("Received empty block range from peer: {peer_id}");
+                            block_cache.clear_attempted(key);
+                            *saw_empty_range = true;
+                            continue;
+                        }
+
+                        let range_end = range.start_slot + range.count;
+                        let out_of_range = blocks.iter().any(|block| {
+                            block.message.slot < range.start_slot || block.message.slot >= range_end
+                        });
+                        if out_of_range {
+                            warn!(
+                                "Peer {peer_id} returned block(s) outside the requested range {range:?}"
+                            );
+                            block_cache.mark_attempted(key, *peer_id, candidate_peers, now);
                             block_cache.push_retry_range(*range);
-                            peer_manager.ban_peer(peer_id, BanReason::EmptyResponse);
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(
+                                    "block(s) outside the requested range".to_string(),
+                                ),
+                            );
                             continue;
                         }
 
@@ -655,17 +941,18 @@ fn poll_ready_tasks(
 
                         if let Err(err) = block_cache.add_blocks(blocks, true) {
                             warn!("Failed to add downloaded blocks to cache: {err:?}");
+                            block_cache.mark_attempted(key, *peer_id, candidate_peers, now);
                             block_cache.push_retry_range(*range);
-                        } else if needs_columns {
-                            block_cache.push_column_range(*range);
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(format!("invalid block range: {err:?}")),
+                            );
+                        } else {
+                            block_cache.clear_attempted(key);
+                            if needs_columns {
+                                block_cache.push_column_range(*range);
+                            }
                         }
-                    }
-                    Poll::Ready(Err(err)) => {
-                        warn!("Forward fill task failed: {err}");
-                        peer_manager.mark_peer_as_idle(peer_id);
-                        block_cache.remove_block_range_in_progress(range);
-                        block_cache.push_retry_range(*range);
-                        indexes_to_remove.push(index);
                     }
                     Poll::Pending => {}
                 }
@@ -674,55 +961,120 @@ fn poll_ready_tasks(
                 handle,
                 range,
                 peer_id,
+                expected_known_identifiers,
             } => {
                 let pinned = Pin::new(handle);
 
                 match pinned.poll(&mut context) {
-                    Poll::Ready(Ok(columns_result)) => {
+                    Poll::Ready(result) => {
                         indexes_to_remove.push(index);
                         block_cache.remove_column_range_in_progress(range);
                         peer_manager.mark_peer_as_idle(peer_id);
-                        let columns = match columns_result {
-                            Ok(columns) => columns,
-                            Err(err) => {
-                                warn!("Failed to fetch data columns from peer: {err:?}");
-                                block_cache.push_column_range(*range);
-                                continue;
-                            }
-                        };
+                        let key = RequestKey::ColumnRange(*range);
 
-                        let columns = match columns {
-                            Ok(columns) => columns,
-                            Err(err) => {
-                                block_cache.push_column_range(*range);
-                                peer_manager.ban_peer(
-                                    peer_id,
-                                    BanReason::ProtocolError(format!("{err:?}")),
+                        let Some(columns) = handle_stream_outcome(peer_manager, peer_id, result)
+                        else {
+                            block_cache.mark_attempted(key, *peer_id, candidate_peers, now);
+                            for identifier in expected_known_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
                                 );
-                                continue;
                             }
+                            continue;
                         };
 
                         if columns.is_empty() {
-                            warn!("Received empty data column range from peer: {peer_id}");
-                            block_cache.push_column_range(*range);
-                            peer_manager.ban_peer(peer_id, BanReason::EmptyResponse);
+                            info!("Received empty data column range from peer: {peer_id}");
+                            block_cache.clear_attempted(key);
+                            for identifier in expected_known_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                            *saw_empty_range = true;
                             continue;
                         }
 
+                        let range_end = range.start_slot + range.count;
+                        let mut seen_identifiers = HashSet::new();
+                        let out_of_shape = columns.iter().any(|column| {
+                            let slot = column.signed_block_header.message.slot;
+                            let identifier = ColumnIdentifier::new(
+                                column.signed_block_header.message.tree_hash_root(),
+                                column.index,
+                            );
+                            slot < range.start_slot
+                                || slot >= range_end
+                                || !required_columns.contains(&column.index)
+                                || !seen_identifiers.insert(identifier)
+                        });
+                        if out_of_shape {
+                            warn!(
+                                "Peer {peer_id} returned data column(s) outside the requested range/columns, or a duplicate, for range {range:?}"
+                            );
+                            block_cache.clear_attempted(key);
+                            for identifier in expected_known_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(
+                                    "data column(s) outside the requested range/columns, or a duplicate"
+                                        .to_string(),
+                                ),
+                            );
+                            continue;
+                        }
+
+                        let returned: HashSet<ColumnIdentifier> = columns
+                            .iter()
+                            .map(|column| {
+                                ColumnIdentifier::new(
+                                    column.signed_block_header.message.tree_hash_root(),
+                                    column.index,
+                                )
+                            })
+                            .collect();
+
                         if let Err(err) = block_cache.add_data_columns(columns, required_columns) {
                             warn!("Failed to add downloaded data columns to cache: {err:?}");
-                            block_cache.push_column_range(*range);
+                            block_cache.clear_attempted(key);
+                            for identifier in expected_known_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
                             peer_manager
                                 .ban_peer(peer_id, BanReason::InvalidProof(format!("{err:?}")));
+                        } else {
+                            block_cache.clear_attempted(key);
+                            for identifier in expected_known_identifiers.iter() {
+                                if returned.contains(identifier) {
+                                    block_cache.clear_attempted(RequestKey::Column(*identifier));
+                                } else {
+                                    block_cache.mark_attempted(
+                                        RequestKey::Column(*identifier),
+                                        *peer_id,
+                                        candidate_peers,
+                                        now,
+                                    );
+                                }
+                            }
                         }
-                    }
-                    Poll::Ready(Err(err)) => {
-                        warn!("Forward fill task failed: {err}");
-                        peer_manager.mark_peer_as_idle(peer_id);
-                        block_cache.remove_column_range_in_progress(range);
-                        block_cache.push_column_range(*range);
-                        indexes_to_remove.push(index);
                     }
                     Poll::Pending => {}
                 }
@@ -735,45 +1087,74 @@ fn poll_ready_tasks(
                 let pinned = Pin::new(handle);
 
                 match pinned.poll(&mut context) {
-                    Poll::Ready(Ok(blocks_result)) => {
+                    Poll::Ready(result) => {
                         indexes_to_remove.push(index);
                         block_cache.remove_block_roots_in_progress(roots);
                         peer_manager.mark_peer_as_idle(peer_id);
-                        let blocks = match blocks_result {
-                            Ok(blocks) => blocks,
-                            Err(err) => {
-                                warn!("Failed to fetch blocks from peer: {err:?}");
-                                continue;
+
+                        let Some(blocks) = handle_stream_outcome(peer_manager, peer_id, result)
+                        else {
+                            for root in roots.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::BlockRoot(*root),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
                             }
+                            continue;
                         };
 
-                        let blocks = match blocks {
-                            Ok(blocks) => blocks,
-                            Err(err) => {
-                                warn!("Failed to fetch blocks from roots: {err:?}");
-                                peer_manager.ban_peer(
-                                    peer_id,
-                                    BanReason::ProtocolError(format!("{err:?}")),
+                        let requested: HashSet<B256> = roots.iter().copied().collect();
+                        let has_unexpected = blocks
+                            .iter()
+                            .any(|block| !requested.contains(&block.message.tree_hash_root()));
+                        if has_unexpected {
+                            warn!(
+                                "Peer {peer_id} returned block(s) with an unrequested root for a BlockRoots request"
+                            );
+                            for root in roots.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::BlockRoot(*root),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
                                 );
-                                continue;
                             }
-                        };
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(
+                                    "returned block(s) with an unrequested root".to_string(),
+                                ),
+                            );
+                            continue;
+                        }
+
+                        let returned: HashSet<B256> = blocks
+                            .iter()
+                            .map(|block| block.message.tree_hash_root())
+                            .collect();
+                        for root in roots.iter() {
+                            if returned.contains(root) {
+                                block_cache.clear_attempted(RequestKey::BlockRoot(*root));
+                            } else {
+                                block_cache.mark_attempted(
+                                    RequestKey::BlockRoot(*root),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                        }
 
                         if blocks.is_empty() {
                             warn!("Received empty block roots from peer: {peer_id}");
-                            peer_manager.ban_peer(peer_id, BanReason::EmptyResponse);
                             continue;
                         }
 
                         if let Err(err) = block_cache.add_blocks(blocks, false) {
                             warn!("Failed to add downloaded blocks to cache: {err:?}");
                         }
-                    }
-                    Poll::Ready(Err(err)) => {
-                        warn!("Forward fill task failed: {err}");
-                        peer_manager.mark_peer_as_idle(peer_id);
-                        block_cache.remove_block_roots_in_progress(roots);
-                        indexes_to_remove.push(index);
                     }
                     Poll::Pending => {}
                 }
@@ -786,45 +1167,99 @@ fn poll_ready_tasks(
                 let pinned = Pin::new(handle);
 
                 match pinned.poll(&mut context) {
-                    Poll::Ready(Ok(blob_sidecars_result)) => {
+                    Poll::Ready(result) => {
                         indexes_to_remove.push(index);
                         block_cache.remove_blob_identifiers_in_progress(blob_identifiers);
                         peer_manager.mark_peer_as_idle(peer_id);
-                        let blob_sidecars = match blob_sidecars_result {
-                            Ok(blob_sidecars) => blob_sidecars,
-                            Err(err) => {
-                                warn!("Failed to fetch blobs from peer: {err:?}");
-                                continue;
-                            }
-                        };
 
-                        let blob_sidecars = match blob_sidecars {
-                            Ok(blob_sidecars) => blob_sidecars,
-                            Err(err) => {
-                                warn!("Failed to fetch blobs from identifiers: {err:?}");
-                                peer_manager.ban_peer(
-                                    peer_id,
-                                    BanReason::ProtocolError(format!("{err:?}")),
+                        let Some(blob_sidecars) =
+                            handle_stream_outcome(peer_manager, peer_id, result)
+                        else {
+                            for identifier in blob_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Blob(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
                                 );
-                                continue;
                             }
+                            continue;
                         };
 
                         if blob_sidecars.is_empty() {
                             warn!("Received empty blob identifiers from peer: {peer_id}");
-                            peer_manager.ban_peer(peer_id, BanReason::EmptyResponse);
+                            for identifier in blob_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Blob(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
                             continue;
                         }
 
+                        let requested: HashSet<BlobIdentifier> =
+                            blob_identifiers.iter().copied().collect();
+                        let has_unexpected = blob_sidecars.iter().any(|sidecar| {
+                            !requested.contains(&BlobIdentifier {
+                                block_root: sidecar.signed_block_header.message.tree_hash_root(),
+                                index: sidecar.index,
+                            })
+                        });
+                        if has_unexpected {
+                            warn!("Peer {peer_id} returned unrequested blob sidecar(s)");
+                            for identifier in blob_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Blob(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(
+                                    "returned unrequested blob sidecar(s)".to_string(),
+                                ),
+                            );
+                            continue;
+                        }
+
+                        let returned: HashSet<BlobIdentifier> = blob_sidecars
+                            .iter()
+                            .map(|sidecar| BlobIdentifier {
+                                block_root: sidecar.signed_block_header.message.tree_hash_root(),
+                                index: sidecar.index,
+                            })
+                            .collect();
+
                         if let Err(err) = block_cache.add_blobs(blob_sidecars) {
                             warn!("Failed to add downloaded blobs to cache: {err:?}");
+                            for identifier in blob_identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Blob(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                            peer_manager
+                                .ban_peer(peer_id, BanReason::InvalidProof(format!("{err:?}")));
+                        } else {
+                            for identifier in blob_identifiers.iter() {
+                                if returned.contains(identifier) {
+                                    block_cache.clear_attempted(RequestKey::Blob(*identifier));
+                                } else {
+                                    block_cache.mark_attempted(
+                                        RequestKey::Blob(*identifier),
+                                        *peer_id,
+                                        candidate_peers,
+                                        now,
+                                    );
+                                }
+                            }
                         }
-                    }
-                    Poll::Ready(Err(err)) => {
-                        warn!("Forward fill task failed: {err}");
-                        peer_manager.mark_peer_as_idle(peer_id);
-                        block_cache.remove_blob_identifiers_in_progress(blob_identifiers);
-                        indexes_to_remove.push(index);
                     }
                     Poll::Pending => {}
                 }
@@ -837,47 +1272,100 @@ fn poll_ready_tasks(
                 let pinned = Pin::new(handle);
 
                 match pinned.poll(&mut context) {
-                    Poll::Ready(Ok(columns_result)) => {
+                    Poll::Ready(result) => {
                         indexes_to_remove.push(index);
                         block_cache.remove_data_column_identifiers_in_progress(identifiers);
                         peer_manager.mark_peer_as_idle(peer_id);
-                        let columns = match columns_result {
-                            Ok(columns) => columns,
-                            Err(err) => {
-                                warn!("Failed to fetch data columns from peer: {err:?}");
-                                continue;
-                            }
-                        };
 
-                        let columns = match columns {
-                            Ok(columns) => columns,
-                            Err(err) => {
-                                warn!("Failed to fetch data columns from identifiers: {err:?}");
-                                peer_manager.ban_peer(
-                                    peer_id,
-                                    BanReason::ProtocolError(format!("{err:?}")),
+                        let Some(columns) = handle_stream_outcome(peer_manager, peer_id, result)
+                        else {
+                            for identifier in identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
                                 );
-                                continue;
                             }
+                            continue;
                         };
 
                         if columns.is_empty() {
                             warn!("Received empty data column identifiers from peer: {peer_id}");
-                            peer_manager.ban_peer(peer_id, BanReason::EmptyResponse);
+                            for identifier in identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
                             continue;
                         }
 
+                        let requested: HashSet<ColumnIdentifier> =
+                            identifiers.iter().copied().collect();
+                        let has_unexpected = columns.iter().any(|column| {
+                            !requested.contains(&ColumnIdentifier::new(
+                                column.signed_block_header.message.tree_hash_root(),
+                                column.index,
+                            ))
+                        });
+                        if has_unexpected {
+                            warn!("Peer {peer_id} returned unrequested data column(s)");
+                            for identifier in identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(
+                                    "returned unrequested data column(s)".to_string(),
+                                ),
+                            );
+                            continue;
+                        }
+
+                        let returned: HashSet<ColumnIdentifier> = columns
+                            .iter()
+                            .map(|column| {
+                                ColumnIdentifier::new(
+                                    column.signed_block_header.message.tree_hash_root(),
+                                    column.index,
+                                )
+                            })
+                            .collect();
+
                         if let Err(err) = block_cache.add_data_columns(columns, required_columns) {
                             warn!("Failed to add downloaded data columns to cache: {err:?}");
+                            for identifier in identifiers.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::Column(*identifier),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
                             peer_manager
                                 .ban_peer(peer_id, BanReason::InvalidProof(format!("{err:?}")));
+                        } else {
+                            for identifier in identifiers.iter() {
+                                if returned.contains(identifier) {
+                                    block_cache.clear_attempted(RequestKey::Column(*identifier));
+                                } else {
+                                    block_cache.mark_attempted(
+                                        RequestKey::Column(*identifier),
+                                        *peer_id,
+                                        candidate_peers,
+                                        now,
+                                    );
+                                }
+                            }
                         }
-                    }
-                    Poll::Ready(Err(err)) => {
-                        warn!("Forward fill task failed: {err}");
-                        peer_manager.mark_peer_as_idle(peer_id);
-                        block_cache.remove_data_column_identifiers_in_progress(identifiers);
-                        indexes_to_remove.push(index);
                     }
                     Poll::Pending => {}
                 }
@@ -899,9 +1387,12 @@ mod tests {
     use discv5::{Enr, enr::CombinedKey};
     use kzg::{G1, eip_4844::compute_blob_kzg_proof_raw};
     use parking_lot::RwLock;
-    use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
-    use ream_consensus_misc::polynomial_commitments::{
-        kzg_commitment::KZGCommitment, kzg_proof::KZGProof,
+    use ream_consensus_beacon::{
+        data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::BeaconBlock,
+    };
+    use ream_consensus_misc::{
+        checkpoint::Checkpoint,
+        polynomial_commitments::{kzg_commitment::KZGCommitment, kzg_proof::KZGProof},
     };
     use ream_execution_rpc_types::get_blobs::{Blob, BlobAndProofV1};
     use ream_network_spec::networks::beacon::initialize_test_network_spec;
@@ -1006,6 +1497,51 @@ mod tests {
         })
     }
 
+    fn test_peer_manager_with_one_peer() -> (PeerManager, PeerId) {
+        let network_state = test_network_state();
+        let peer_id = PeerId::random();
+        let mut peer = CachedPeer::new(
+            peer_id,
+            None,
+            ConnectionState::Connected,
+            Direction::Outbound,
+            None,
+        );
+        peer.status = Some(Status::default());
+        network_state.peer_table.write().insert(peer_id, peer);
+
+        let mut peer_manager = PeerManager::new(network_state);
+        peer_manager.update_peer_set();
+        (peer_manager, peer_id)
+    }
+
+    fn poll_until_done(
+        tasks: &mut Vec<DownloadTask>,
+        block_cache: &mut BlockCache,
+        peer_manager: &mut PeerManager,
+        required_columns: &HashSet<u64>,
+        saw_empty_range: &mut bool,
+        candidate_peers: &[PeerId],
+    ) {
+        for _ in 0..500 {
+            poll_ready_tasks(
+                tasks,
+                block_cache,
+                peer_manager,
+                required_columns,
+                saw_empty_range,
+                candidate_peers,
+                Instant::now(),
+            )
+            .expect("poll_ready_tasks should not error");
+            if tasks.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("task did not complete within the test timeout");
+    }
+
     /// `start()` must hand `self` back out even on an ordinary segment error, not just success,
     /// or the caller loses the syncer (and its warmed-up peer table) and can never retry.
     #[test]
@@ -1061,23 +1597,33 @@ mod tests {
                 .slot_index_provider()
                 .insert(highest_slot, highest_root)
                 .expect("insert highest synced slot");
+            store
+                .db
+                .finalized_checkpoint_provider()
+                .insert(Checkpoint {
+                    epoch: 0,
+                    root: B256::ZERO,
+                })
+                .expect("insert finalized checkpoint");
         }
 
         let network_state = test_network_state();
-        let peer_id = PeerId::random();
-        let mut peer = CachedPeer::new(
-            peer_id,
-            None,
-            ConnectionState::Connected,
-            Direction::Outbound,
-            None,
-        );
-        peer.status = Some(Status {
-            head_slot: highest_slot,
-            head_root: highest_root,
-            ..Default::default()
-        });
-        network_state.peer_table.write().insert(peer_id, peer);
+        for _ in 0..MIN_SYNC_PEERS {
+            let peer_id = PeerId::random();
+            let mut peer = CachedPeer::new(
+                peer_id,
+                None,
+                ConnectionState::Connected,
+                Direction::Outbound,
+                None,
+            );
+            peer.status = Some(Status {
+                head_slot: highest_slot,
+                head_root: highest_root,
+                ..Default::default()
+            });
+            network_state.peer_table.write().insert(peer_id, peer);
+        }
 
         let (p2p_sender, _p2p_receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut syncer = BlockRangeSyncer::new(
@@ -1111,5 +1657,225 @@ mod tests {
             .insert((highest_slot + 10_000) * seconds_per_slot)
             .expect("insert time");
         assert!(!syncer.is_synced_to_head_slot().await);
+    }
+
+    #[test]
+    fn poll_ready_tasks_partial_block_roots_marks_only_the_omitted_root_attempted() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let delivered_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 1,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let delivered_root = delivered_block.message.tree_hash_root();
+        let omitted_root = B256::repeat_byte(9);
+
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        let handle = executor.spawn(async move { StreamOutcome::Complete(vec![delivered_block]) });
+        let mut tasks = vec![DownloadTask::new_block_roots(
+            handle,
+            vec![delivered_root, omitted_root],
+            peer_id,
+        )];
+
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::new(),
+            &mut false,
+            &[peer_id],
+        );
+
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::BlockRoot(delivered_root))
+                .is_empty(),
+            "a delivered root must not be marked as a failed attempt"
+        );
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::BlockRoot(omitted_root))
+                .contains(&peer_id),
+            "the omitted root must be attributed to this peer, so a retry excludes it"
+        );
+    }
+
+    #[test]
+    fn poll_ready_tasks_unrequested_block_root_bans_peer_and_discards_whole_batch() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let requested_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 1,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let requested_root = requested_block.message.tree_hash_root();
+        let unrequested_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 2,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        let handle = executor.spawn(async move {
+            StreamOutcome::Complete(vec![requested_block, unrequested_block])
+        });
+        let mut tasks = vec![DownloadTask::new_block_roots(
+            handle,
+            vec![requested_root],
+            peer_id,
+        )];
+
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::new(),
+            &mut false,
+            &[peer_id],
+        );
+
+        assert_eq!(
+            block_cache.block_count(),
+            0,
+            "a response with any unrequested item is atomically discarded -- even the \
+             requested, otherwise-valid item in the same batch must not be committed"
+        );
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::BlockRoot(requested_root))
+                .contains(&peer_id),
+            "the requested root must still be attributed to this peer's failed attempt"
+        );
+        assert!(
+            peer_manager.fetch_idle_peer_from(&[peer_id]).is_none(),
+            "a peer that smuggled in an unrequested item must be banned, not just marked idle"
+        );
+    }
+
+    #[test]
+    fn poll_ready_tasks_empty_data_column_range_falls_through_to_by_root_and_excludes_peer() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let range = Range::new(1, 10);
+        let identifier = ColumnIdentifier::new(B256::repeat_byte(3), 0);
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        let handle =
+            executor.spawn(async move { StreamOutcome::Complete(Vec::<DataColumnSidecar>::new()) });
+        let mut tasks = vec![DownloadTask::new_data_column_range(
+            handle,
+            range,
+            peer_id,
+            vec![identifier],
+        )];
+
+        let mut saw_empty_range = false;
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::new(),
+            &mut saw_empty_range,
+            &[peer_id],
+        );
+
+        assert!(saw_empty_range);
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::Column(identifier))
+                .contains(&peer_id),
+            "the expected identifier must fall through to the by-root fallback, excluding this peer"
+        );
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::ColumnRange(range))
+                .is_empty(),
+            "an empty range response is accepted (settled), not held as a pending attempt"
+        );
+    }
+
+    #[test]
+    fn poll_ready_tasks_invalid_blob_proof_bans_peer_and_marks_it_attempted() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let blob = Blob::default();
+        let blob_bytes = blob.to_fixed_bytes();
+        let raw_commitment = das_context()
+            .blob_to_kzg_commitment(&blob_bytes)
+            .expect("test blob should produce a commitment");
+        let commitment = KZGCommitment(raw_commitment);
+        let proof = KZGProof::from(
+            compute_blob_kzg_proof_raw(
+                blob_bytes,
+                raw_commitment,
+                ream_polynomial_commitments::trusted_setup::blst_settings(),
+            )
+            .expect("test blob should produce a proof")
+            .to_bytes(),
+        );
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let block_root = block.message.tree_hash_root();
+        let identifier = BlobIdentifier::new(block_root, 0);
+        let mut sidecar = block
+            .blob_sidecar(BlobAndProofV1 { blob, proof }, 0)
+            .expect("test sidecar should be constructed");
+        sidecar.kzg_proof[0] ^= 1;
+
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        block_cache
+            .add_blocks(vec![block], false)
+            .expect("block should enter cache");
+
+        let handle = executor.spawn(async move { StreamOutcome::Complete(vec![sidecar]) });
+        let mut tasks = vec![DownloadTask::new_blob_identifiers(
+            handle,
+            vec![identifier],
+            peer_id,
+        )];
+
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::new(),
+            &mut false,
+            &[peer_id],
+        );
+
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::Blob(identifier))
+                .contains(&peer_id),
+            "the dependency must be attributed to this peer so a retry picks someone else"
+        );
+        assert!(
+            peer_manager.fetch_idle_peer_from(&[peer_id]).is_none(),
+            "a peer that served an invalid blob proof must be banned, not just marked idle"
+        );
     }
 }

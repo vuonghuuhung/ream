@@ -1,10 +1,9 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use alloy_primitives::B256;
 use libp2p::PeerId;
 use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
 use ream_p2p::network::beacon::{network_state::NetworkState, peer::CachedPeer};
@@ -13,18 +12,27 @@ use tracing::warn;
 /// How long a peer stays banned before it becomes eligible to rejoin the peer set.
 const BAN_DURATION: Duration = Duration::from_secs(300);
 
-/// Majority-agreed (slot, root), tagged with root so peer selection can target this chain.
+pub const MIN_SYNC_PEERS: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetSelection {
+    Ready {
+        target_slot: u64,
+        eligible_peers: Vec<PeerId>,
+    },
+    NoQuorum,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SyncTarget {
-    pub slot: u64,
-    pub root: B256,
+pub enum TargetQualification {
+    FinalizedEpoch(u64),
+    HeadEpoch(u64),
 }
 
 /// Why a peer was banned. Still just bans outright either way, but structured (instead of a
 /// free-text string) so a future scoring system can weigh severities without touching call sites.
 #[derive(Debug, Clone)]
 pub enum BanReason {
-    EmptyResponse,
     /// Disconnect, timeout, decode error, or a response that didn't fit the cache.
     ProtocolError(String),
     /// Failed KZG or inclusion proof verification.
@@ -34,7 +42,6 @@ pub enum BanReason {
 impl std::fmt::Display for BanReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BanReason::EmptyResponse => write!(f, "empty response"),
             BanReason::ProtocolError(detail) => write!(f, "protocol error: {detail}"),
             BanReason::InvalidProof(detail) => write!(f, "invalid proof: {detail}"),
         }
@@ -124,20 +131,35 @@ impl PeerManager {
         None
     }
 
-    pub fn fetch_idle_peer_preferring(&mut self, target_root: Option<B256>) -> Option<CachedPeer> {
-        if let Some(target_root) = target_root {
-            for peer_info in self.peers.values_mut() {
-                let matches_target = peer_info.peer.status.as_ref().is_some_and(|status| {
-                    status.head_root == target_root || status.finalized_root == target_root
-                });
-                if matches_target && matches!(peer_info.peer_status, PeerStatus::Idle) {
-                    peer_info.peer_status = PeerStatus::Downloading;
-                    return Some(peer_info.peer.clone());
-                }
+    pub fn fetch_idle_peer_from(&mut self, eligible: &[PeerId]) -> Option<CachedPeer> {
+        for peer_id in eligible {
+            if let Some(peer_info) = self.peers.get_mut(peer_id)
+                && matches!(peer_info.peer_status, PeerStatus::Idle)
+            {
+                peer_info.peer_status = PeerStatus::Downloading;
+                return Some(peer_info.peer.clone());
             }
         }
+        None
+    }
 
-        self.fetch_idle_peer()
+    pub fn fetch_idle_peer_from_excluding(
+        &mut self,
+        eligible: &[PeerId],
+        excluded: &HashSet<PeerId>,
+    ) -> Option<CachedPeer> {
+        for peer_id in eligible {
+            if excluded.contains(peer_id) {
+                continue;
+            }
+            if let Some(peer_info) = self.peers.get_mut(peer_id)
+                && matches!(peer_info.peer_status, PeerStatus::Idle)
+            {
+                peer_info.peer_status = PeerStatus::Downloading;
+                return Some(peer_info.peer.clone());
+            }
+        }
+        None
     }
 
     pub fn peer_counts(&self) -> String {
@@ -162,47 +184,107 @@ impl PeerManager {
         }
     }
 
-    /// Majority vote on (epoch, root), not just epoch, so two forks can't be merged as "agreed".
-    pub fn finalized_target(&self) -> Option<SyncTarget> {
-        let mut frequencies: HashMap<(u64, B256), usize> = HashMap::new();
+    pub fn best_finalized(&self, our_finalized_epoch: u64) -> TargetSelection {
+        let mut votes: HashMap<u64, usize> = HashMap::new();
+        let mut candidates: Vec<(PeerId, u64, u64)> = Vec::new();
 
-        for peer in self.peers.values() {
-            if let Some(status) = &peer.peer.status {
-                *frequencies
-                    .entry((
-                        status.finalized_epoch * SLOTS_PER_EPOCH,
-                        status.finalized_root,
-                    ))
-                    .or_insert(0) += 1;
+        for (peer_id, peer_info) in &self.peers {
+            let Some(status) = &peer_info.peer.status else {
+                continue;
+            };
+            if status.finalized_epoch < our_finalized_epoch {
+                continue;
             }
+            *votes.entry(status.finalized_epoch).or_insert(0) += 1;
+            candidates.push((*peer_id, status.finalized_epoch, status.head_slot));
         }
 
-        frequencies
+        let Some(winner_epoch) = votes
+            .iter()
+            .max_by(|(epoch_a, votes_a), (epoch_b, votes_b)| {
+                votes_a.cmp(votes_b).then(epoch_a.cmp(epoch_b))
+            })
+            .map(|(&epoch, _)| epoch)
+        else {
+            return TargetSelection::NoQuorum;
+        };
+
+        let mut eligible: Vec<(PeerId, u64, u64)> = candidates
             .into_iter()
-            .max_by_key(|&(_, count)| count)
-            .map(|((slot, root), _)| SyncTarget { slot, root })
+            .filter(|(_, epoch, _)| *epoch >= winner_epoch)
+            .collect();
+        eligible.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+
+        TargetSelection::Ready {
+            target_slot: winner_epoch * SLOTS_PER_EPOCH,
+            eligible_peers: eligible.into_iter().map(|(id, ..)| id).collect(),
+        }
     }
 
-    /// Majority vote on (slot, root); replaces a bare max() so one outlier can't skew the target.
-    pub fn head_target(&self) -> Option<SyncTarget> {
-        let mut frequencies: HashMap<(u64, B256), usize> = HashMap::new();
+    pub fn best_non_finalized(&self, min_peers: usize, our_head_epoch: u64) -> TargetSelection {
+        let our_head_slot = our_head_epoch * SLOTS_PER_EPOCH;
+        let mut epoch_votes: HashMap<u64, usize> = HashMap::new();
+        let mut candidates: Vec<(PeerId, u64, u64)> = Vec::new();
 
-        for peer in self.peers.values() {
-            if let Some(status) = &peer.peer.status {
-                *frequencies
-                    .entry((status.head_slot, status.head_root))
-                    .or_insert(0) += 1;
+        for (peer_id, peer_info) in &self.peers {
+            let Some(status) = &peer_info.peer.status else {
+                continue;
+            };
+            if status.head_slot <= our_head_slot {
+                continue;
             }
+            let epoch = status.head_slot / SLOTS_PER_EPOCH;
+            *epoch_votes.entry(epoch).or_insert(0) += 1;
+            candidates.push((*peer_id, epoch, status.head_slot));
         }
 
-        frequencies
+        let Some(target_epoch) = epoch_votes
+            .iter()
+            .filter(|&(_, &votes)| votes >= min_peers)
+            .map(|(&epoch, _)| epoch)
+            .max()
+        else {
+            return TargetSelection::NoQuorum;
+        };
+
+        let eligible: Vec<(PeerId, u64)> = candidates
             .into_iter()
-            .max_by_key(|&(_, count)| count)
-            .map(|((slot, root), _)| SyncTarget { slot, root })
+            .filter(|(_, epoch, _)| *epoch >= target_epoch)
+            .map(|(id, _, head_slot)| (id, head_slot))
+            .collect();
+
+        let target_slot = eligible
+            .iter()
+            .filter(|(_, head_slot)| head_slot / SLOTS_PER_EPOCH == target_epoch)
+            .map(|(_, head_slot)| *head_slot)
+            .max()
+            .unwrap_or(target_epoch * SLOTS_PER_EPOCH);
+
+        let mut eligible = eligible;
+        eligible.sort_by_key(|&(_, head_slot)| std::cmp::Reverse(head_slot));
+
+        TargetSelection::Ready {
+            target_slot,
+            eligible_peers: eligible.into_iter().map(|(id, _)| id).collect(),
+        }
     }
 
-    pub fn sync_target(&self) -> Option<SyncTarget> {
-        self.head_target().or_else(|| self.finalized_target())
+    pub fn peers_satisfying(&self, qualification: TargetQualification) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|(_, info)| {
+                let Some(status) = &info.peer.status else {
+                    return false;
+                };
+                match qualification {
+                    TargetQualification::FinalizedEpoch(epoch) => status.finalized_epoch >= epoch,
+                    TargetQualification::HeadEpoch(epoch) => {
+                        status.head_slot / SLOTS_PER_EPOCH >= epoch
+                    }
+                }
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect()
     }
 }
 
@@ -251,47 +333,31 @@ mod tests {
     }
 
     #[test]
-    fn finalized_target_does_not_merge_different_forks_with_same_epoch() {
+    fn best_finalized_excludes_peers_behind_our_epoch() {
         let mut peer_manager = PeerManager::new(test_network_state());
-        let root_a = B256::repeat_byte(0xAA);
-        let root_b = B256::repeat_byte(0xBB);
-
         insert_idle(
             &mut peer_manager,
             test_peer(Status {
-                finalized_epoch: 10,
-                finalized_root: root_a,
-                ..Default::default()
-            }),
-        );
-        insert_idle(
-            &mut peer_manager,
-            test_peer(Status {
-                finalized_epoch: 10,
-                finalized_root: root_b,
+                finalized_epoch: 5,
                 ..Default::default()
             }),
         );
 
-        // 1 vote each: must not merge into a false "2 votes" just because the epoch matches.
-        let target = peer_manager
-            .finalized_target()
-            .expect("a target should be picked");
-        assert!(target.root == root_a || target.root == root_b);
+        assert_eq!(
+            peer_manager.best_finalized(10),
+            TargetSelection::NoQuorum,
+            "the only peer is behind our own finalized epoch, so there's no target to chase"
+        );
     }
 
     #[test]
-    fn head_target_ignores_outlier_without_plurality() {
+    fn best_finalized_is_plurality_not_majority_with_tie_break_by_higher_epoch() {
         let mut peer_manager = PeerManager::new(test_network_state());
-        let honest_root = B256::repeat_byte(0x11);
-        let lying_root = B256::repeat_byte(0x22);
-
-        for _ in 0..3 {
+        for _ in 0..2 {
             insert_idle(
                 &mut peer_manager,
                 test_peer(Status {
-                    head_slot: 100,
-                    head_root: honest_root,
+                    finalized_epoch: 10,
                     ..Default::default()
                 }),
             );
@@ -299,50 +365,149 @@ mod tests {
         insert_idle(
             &mut peer_manager,
             test_peer(Status {
-                head_slot: 999_999,
-                head_root: lying_root,
+                finalized_epoch: 12,
                 ..Default::default()
             }),
         );
 
-        let target = peer_manager
-            .head_target()
-            .expect("a target should be picked");
-        assert_eq!(target.slot, 100);
-        assert_eq!(target.root, honest_root);
+        let TargetSelection::Ready {
+            target_slot,
+            eligible_peers,
+        } = peer_manager.best_finalized(0)
+        else {
+            panic!("expected a target");
+        };
+        assert_eq!(target_slot, 10 * SLOTS_PER_EPOCH);
+        assert_eq!(eligible_peers.len(), 3);
     }
 
     #[test]
-    fn fetch_idle_peer_preferring_prefers_matching_root_then_falls_back() {
+    fn best_non_finalized_uses_a_threshold_not_a_plurality_vote() {
         let mut peer_manager = PeerManager::new(test_network_state());
-        let target_root = B256::repeat_byte(0x33);
-        let other_root = B256::repeat_byte(0x44);
-
-        let matching = test_peer(Status {
-            head_root: target_root,
-            ..Default::default()
-        });
-        let matching_id = matching.peer_id;
+        for _ in 0..3 {
+            insert_idle(
+                &mut peer_manager,
+                test_peer(Status {
+                    head_slot: 20 * SLOTS_PER_EPOCH,
+                    ..Default::default()
+                }),
+            );
+        }
         insert_idle(
             &mut peer_manager,
             test_peer(Status {
-                head_root: other_root,
+                head_slot: 21 * SLOTS_PER_EPOCH,
                 ..Default::default()
             }),
         );
-        insert_idle(&mut peer_manager, matching);
+
+        let TargetSelection::Ready { target_slot, .. } = peer_manager.best_non_finalized(1, 0)
+        else {
+            panic!("expected a target");
+        };
+        assert_eq!(target_slot, 21 * SLOTS_PER_EPOCH);
+    }
+
+    #[test]
+    fn best_non_finalized_returns_no_quorum_below_min_peers_even_with_peers_ahead() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        insert_idle(
+            &mut peer_manager,
+            test_peer(Status {
+                head_slot: 20 * SLOTS_PER_EPOCH,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(
+            peer_manager.best_non_finalized(3, 0),
+            TargetSelection::NoQuorum,
+            "one peer is ahead of us, but not enough to clear min_peers=3"
+        );
+    }
+
+    #[test]
+    fn best_non_finalized_refines_target_to_highest_actual_head_slot_in_winning_epoch() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        insert_idle(
+            &mut peer_manager,
+            test_peer(Status {
+                head_slot: 20 * SLOTS_PER_EPOCH + 3,
+                ..Default::default()
+            }),
+        );
+        insert_idle(
+            &mut peer_manager,
+            test_peer(Status {
+                head_slot: 20 * SLOTS_PER_EPOCH + 9,
+                ..Default::default()
+            }),
+        );
+
+        let TargetSelection::Ready { target_slot, .. } = peer_manager.best_non_finalized(1, 0)
+        else {
+            panic!("expected a target");
+        };
+        assert_eq!(target_slot, 20 * SLOTS_PER_EPOCH + 9);
+    }
+
+    #[test]
+    fn fetch_idle_peer_from_returns_first_idle_in_given_order() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let first = test_peer(Status::default());
+        let second = test_peer(Status::default());
+        let first_id = first.peer_id;
+        let second_id = second.peer_id;
+        insert_idle(&mut peer_manager, first);
+        insert_idle(&mut peer_manager, second);
 
         let peer = peer_manager
-            .fetch_idle_peer_preferring(Some(target_root))
+            .fetch_idle_peer_from(&[second_id, first_id])
             .expect("a peer should be found");
-        assert_eq!(peer.peer_id, matching_id);
+        assert_eq!(peer.peer_id, second_id);
 
-        // No peer matches this root: falls back to any idle peer instead of returning None.
-        let unrelated_root = B256::repeat_byte(0x55);
         assert!(
             peer_manager
-                .fetch_idle_peer_preferring(Some(unrelated_root))
-                .is_some()
+                .fetch_idle_peer_from(&[PeerId::random()])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fetch_idle_peer_from_excluding_skips_excluded_peers() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let peer = test_peer(Status::default());
+        let peer_id = peer.peer_id;
+        insert_idle(&mut peer_manager, peer);
+
+        let mut excluded = HashSet::new();
+        excluded.insert(peer_id);
+        assert!(
+            peer_manager
+                .fetch_idle_peer_from_excluding(&[peer_id], &excluded)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peers_satisfying_distinguishes_finalized_and_head_qualification() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let high_head_low_finalized = test_peer(Status {
+            head_slot: 1_000,
+            finalized_epoch: 1,
+            ..Default::default()
+        });
+        let id = high_head_low_finalized.peer_id;
+        insert_idle(&mut peer_manager, high_head_low_finalized);
+
+        assert!(
+            peer_manager
+                .peers_satisfying(TargetQualification::FinalizedEpoch(10))
+                .is_empty()
+        );
+        assert_eq!(
+            peer_manager.peers_satisfying(TargetQualification::HeadEpoch(0)),
+            vec![id]
         );
     }
 
@@ -353,7 +518,7 @@ mod tests {
         let peer_id = peer.peer_id;
         insert_idle(&mut peer_manager, peer);
 
-        peer_manager.ban_peer(&peer_id, BanReason::EmptyResponse);
+        peer_manager.ban_peer(&peer_id, BanReason::ProtocolError("test".to_string()));
         assert!(peer_manager.banned_peers.contains_key(&peer_id));
 
         // Simulate the ban having happened BAN_DURATION ago.
@@ -389,5 +554,21 @@ mod tests {
                 .peer_status,
             PeerStatus::Idle
         ));
+    }
+
+    #[test]
+    fn peers_satisfying_head_epoch_includes_a_peer_below_the_refined_max_slot() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let below_refined_max = test_peer(Status {
+            head_slot: 20 * SLOTS_PER_EPOCH + 3,
+            ..Default::default()
+        });
+        let id = below_refined_max.peer_id;
+        insert_idle(&mut peer_manager, below_refined_max);
+
+        assert_eq!(
+            peer_manager.peers_satisfying(TargetQualification::HeadEpoch(20)),
+            vec![id]
+        );
     }
 }

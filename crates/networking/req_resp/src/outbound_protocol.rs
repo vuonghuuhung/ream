@@ -285,9 +285,19 @@ impl Decoder for OutboundSSZSnappyCodec {
                         }
                     }
                 } else {
-                    Ok(Some(RespMessage::Error(
-                        VariableList::<u8, U256>::from_ssz_bytes(&buf).map(ReqRespError::from).map_err(|err| anyhow!("OutboundSSZSnappyCodec::decode: protocol: {:?}, response_code: {response_code:?}, err: {err:?}", self.protocol.protocol))?,
-                    )))
+                    let message = match VariableList::<u8, U256>::from_ssz_bytes(&buf) {
+                        Ok(bytes) => String::from_utf8(Vec::from(bytes))
+                            .unwrap_or_else(|_| "<invalid UTF-8>".to_string()),
+                        Err(err) => {
+                            return Ok(Some(RespMessage::Error(ReqRespError::InvalidData(
+                                format!("Failed to decode error body: {err:?}"),
+                            ))));
+                        }
+                    };
+                    Ok(Some(RespMessage::Error(ReqRespError::RemoteError {
+                        code: response_code,
+                        message,
+                    })))
                 }
             }
             Err(err) => match err.kind() {

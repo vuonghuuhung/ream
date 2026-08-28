@@ -1,6 +1,6 @@
 use std::io::{self};
 
-use ssz_types::{VariableList, typenum::U256};
+use crate::inbound_protocol::ResponseCode;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ReqRespError {
@@ -12,6 +12,9 @@ pub enum ReqRespError {
 
     #[error("Invalid data {0}")]
     InvalidData(String),
+
+    #[error("Remote error [{code:?}]: {message}")]
+    RemoteError { code: ResponseCode, message: String },
 
     #[error("Incomplete stream")]
     IncompleteStream,
@@ -32,12 +35,5 @@ pub enum ReqRespError {
 impl From<ssz::DecodeError> for ReqRespError {
     fn from(err: ssz::DecodeError) -> Self {
         ReqRespError::InvalidData(format!("Failed to decode ssz: {err:?}"))
-    }
-}
-
-impl From<VariableList<u8, U256>> for ReqRespError {
-    fn from(err: VariableList<u8, U256>) -> Self {
-        let err = String::from_utf8(Vec::from(err)).unwrap_or("Invalid UTF-8".to_string());
-        ReqRespError::InvalidData(format!("ReqResp error message from peer: {err:?}"))
     }
 }

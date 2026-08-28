@@ -11,6 +11,7 @@ use ream_req_resp::{
     beacon::messages::{
         BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier, status::Status,
     },
+    error::ReqRespError,
     handler::RespMessage,
 };
 use tokio::sync::mpsc;
@@ -22,6 +23,14 @@ pub enum P2PCallbackResponse {
     Disconnected,
     Timeout,
     EndOfStream,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum P2PCallbackError {
+    #[error(transparent)]
+    ReqResp(#[from] ReqRespError),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 pub enum P2PMessage {
@@ -44,29 +53,29 @@ pub enum P2PRequest {
         peer_id: PeerId,
         start: u64,
         count: u64,
-        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+        callback: mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>,
     },
     BlockRoots {
         peer_id: PeerId,
         roots: Vec<B256>,
-        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+        callback: mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>,
     },
     BlobIdentifiers {
         peer_id: PeerId,
         blob_identifiers: Vec<BlobIdentifier>,
-        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+        callback: mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>,
     },
     DataColumnRange {
         peer_id: PeerId,
         start: u64,
         count: u64,
         columns: Vec<u64>,
-        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+        callback: mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>,
     },
     DataColumnIdentifiers {
         peer_id: PeerId,
         column_identifiers: Vec<DataColumnsByRootIdentifier>,
-        callback: mpsc::Sender<anyhow::Result<P2PCallbackResponse>>,
+        callback: mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>,
     },
 }
 

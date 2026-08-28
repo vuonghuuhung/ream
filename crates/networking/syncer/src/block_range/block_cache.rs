@@ -1,7 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::B256;
 use anyhow::{bail, ensure};
+use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::is_data_availability_check_required;
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
@@ -10,11 +14,30 @@ use ream_consensus_beacon::{
 };
 use ream_consensus_misc::misc::compute_epoch_at_slot;
 use ream_network_spec::networks::beacon_network_spec;
-use ream_polynomial_commitments::handlers::verify_data_column_sidecar_kzg_proofs;
+use ream_polynomial_commitments::handlers::{
+    verify_blob_kzg_proof_batch, verify_data_column_sidecar_kzg_proofs,
+};
 use ssz::Encode;
 use tree_hash::TreeHash;
 
 use super::{MAX_BLOCKS_PER_REQUEST, peer_range_downloader::Range};
+
+const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestKey {
+    BlockRange(Range),
+    ColumnRange(Range),
+    BlockRoot(B256),
+    Blob(BlobIdentifier),
+    Column(ColumnIdentifier),
+}
+
+#[derive(Default)]
+struct AttemptState {
+    attempted_peers: HashSet<PeerId>,
+    cooldown_until: Option<Instant>,
+}
 
 pub struct BlockAndBlobBundle {
     pub block: SignedBeaconBlock,
@@ -45,6 +68,7 @@ pub struct BlockCache {
     column_ranges_to_fetch: Vec<Range>,
     column_ranges_in_progress: HashSet<Range>,
     data_column_identifiers_in_progress: HashSet<ColumnIdentifier>,
+    attempts: HashMap<RequestKey, AttemptState>,
 }
 
 impl BlockCache {
@@ -62,7 +86,61 @@ impl BlockCache {
             column_ranges_to_fetch: vec![],
             column_ranges_in_progress: HashSet::new(),
             data_column_identifiers_in_progress: HashSet::new(),
+            attempts: HashMap::new(),
         }
+    }
+
+    fn refresh_attempt_round(&mut self, key: &RequestKey, now: Instant) {
+        if let Some(state) = self.attempts.get_mut(key)
+            && let Some(cooldown_until) = state.cooldown_until
+            && now >= cooldown_until
+        {
+            state.attempted_peers.clear();
+            state.cooldown_until = None;
+        }
+    }
+
+    fn is_schedulable(
+        &mut self,
+        key: RequestKey,
+        candidate_peers: &[PeerId],
+        now: Instant,
+    ) -> bool {
+        self.refresh_attempt_round(&key, now);
+        match self.attempts.get(&key) {
+            None => true,
+            Some(state) => candidate_peers
+                .iter()
+                .any(|peer_id| !state.attempted_peers.contains(peer_id)),
+        }
+    }
+
+    pub fn attempted_peers_for(&self, key: RequestKey) -> HashSet<PeerId> {
+        self.attempts
+            .get(&key)
+            .map(|state| state.attempted_peers.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn mark_attempted(
+        &mut self,
+        key: RequestKey,
+        peer_id: PeerId,
+        candidate_peers: &[PeerId],
+        now: Instant,
+    ) {
+        let state = self.attempts.entry(key).or_default();
+        state.attempted_peers.insert(peer_id);
+        if candidate_peers
+            .iter()
+            .all(|peer_id| state.attempted_peers.contains(peer_id))
+        {
+            state.cooldown_until = Some(now + ATTEMPT_COOLDOWN);
+        }
+    }
+
+    pub fn clear_attempted(&mut self, key: RequestKey) {
+        self.attempts.remove(&key);
     }
 
     pub fn add_blocks(
@@ -77,6 +155,10 @@ impl BlockCache {
                     ensure!(
                         block.message.parent_root == blocks[index - 1].message.tree_hash_root(),
                         "Block at index {index} has a parent root that does not match the previous block's tree hash root",
+                    );
+                    ensure!(
+                        block.message.slot > blocks[index - 1].message.slot,
+                        "Block at index {index} does not have a strictly increasing slot",
                     );
                 }
             }
@@ -94,20 +176,60 @@ impl BlockCache {
     }
 
     pub fn add_blobs(&mut self, blobs: Vec<BlobSidecar>) -> anyhow::Result<()> {
+        let mut validated = Vec::with_capacity(blobs.len());
         for blob_sidecar in blobs {
             let block_root = blob_sidecar.signed_block_header.message.tree_hash_root();
-
-            if let Some(bundle) = self.blocks_and_blobs.get_mut(&block_root) {
-                bundle.blobs.insert(
-                    BlobIdentifier {
-                        block_root,
-                        index: blob_sidecar.index,
-                    },
-                    blob_sidecar,
-                );
-            } else {
+            let Some(bundle) = self.blocks_and_blobs.get(&block_root) else {
                 bail!("Block root {block_root} not found in cache, this should be impossible");
-            }
+            };
+
+            ensure!(
+                blob_sidecar.signed_block_header == bundle.block.signed_header(),
+                "Blob sidecar {} does not belong to block {block_root}",
+                blob_sidecar.index
+            );
+            let commitments = &bundle.block.message.body.blob_kzg_commitments;
+            let index = blob_sidecar.index as usize;
+            ensure!(
+                index < commitments.len(),
+                "Blob sidecar index {} out of range for block {block_root}",
+                blob_sidecar.index
+            );
+            ensure!(
+                blob_sidecar.kzg_commitment == commitments[index],
+                "Blob sidecar {} commitment does not match block {block_root}",
+                blob_sidecar.index
+            );
+            ensure!(
+                blob_sidecar.verify_blob_sidecar_inclusion_proof(),
+                "Invalid inclusion proof for blob {} of block {block_root}",
+                blob_sidecar.index
+            );
+            ensure!(
+                verify_blob_kzg_proof_batch(
+                    std::slice::from_ref(&blob_sidecar.blob),
+                    std::slice::from_ref(&blob_sidecar.kzg_commitment),
+                    std::slice::from_ref(&blob_sidecar.kzg_proof),
+                )?,
+                "Invalid KZG proof for blob {} of block {block_root}",
+                blob_sidecar.index
+            );
+
+            validated.push((block_root, blob_sidecar));
+        }
+
+        for (block_root, blob_sidecar) in validated {
+            let bundle = self
+                .blocks_and_blobs
+                .get_mut(&block_root)
+                .expect("presence already checked in the validation pass above");
+            bundle.blobs.insert(
+                BlobIdentifier {
+                    block_root,
+                    index: blob_sidecar.index,
+                },
+                blob_sidecar,
+            );
         }
 
         Ok(())
@@ -118,16 +240,26 @@ impl BlockCache {
         columns: Vec<DataColumnSidecar>,
         required_columns: &HashSet<u64>,
     ) -> anyhow::Result<()> {
+        let mut validated = Vec::with_capacity(columns.len());
         for column in columns {
             if !required_columns.contains(&column.index) {
                 continue;
             }
 
             let block_root = column.signed_block_header.message.tree_hash_root();
-            let Some(bundle) = self.blocks_and_blobs.get_mut(&block_root) else {
-                bail!("Block root {block_root} not found in cache, this should be impossible");
-            };
+            if !self.blocks_and_blobs.contains_key(&block_root) {
+                continue;
+            }
 
+            let bundle = self
+                .blocks_and_blobs
+                .get(&block_root)
+                .expect("presence just checked above");
+            ensure!(
+                column.signed_block_header == bundle.block.signed_header(),
+                "Data column sidecar {} does not belong to block {block_root}",
+                column.index
+            );
             ensure!(
                 column.verify_inclusion_proof(),
                 "Invalid inclusion proof for column {} of block {block_root}",
@@ -139,6 +271,14 @@ impl BlockCache {
                 column.index
             );
 
+            validated.push((block_root, column));
+        }
+
+        for (block_root, column) in validated {
+            let bundle = self
+                .blocks_and_blobs
+                .get_mut(&block_root)
+                .expect("presence already checked in the validation pass above");
             bundle
                 .columns
                 .insert(ColumnIdentifier::new(block_root, column.index), column);
@@ -207,6 +347,10 @@ impl BlockCache {
             .sum()
     }
 
+    pub fn next_start_slot(&self) -> u64 {
+        self.next_start_slot
+    }
+
     pub fn estimated_blocks_to_fetch(&self) -> u64 {
         if self.next_start_slot.saturating_sub(self.initial_slot) > 30 {
             return 0;
@@ -227,38 +371,72 @@ impl BlockCache {
         self.block_ranges_in_progress.remove(range);
     }
 
+    fn take_schedulable_retry_range(
+        &mut self,
+        candidate_peers: &[PeerId],
+        now: Instant,
+    ) -> Option<Range> {
+        let ranges = self.block_ranges_to_retry.clone();
+        for (index, range) in ranges.iter().enumerate().rev() {
+            if self.is_schedulable(RequestKey::BlockRange(*range), candidate_peers, now) {
+                return Some(self.block_ranges_to_retry.remove(index));
+            }
+        }
+        None
+    }
+
+    fn take_schedulable_column_range(
+        &mut self,
+        candidate_peers: &[PeerId],
+        now: Instant,
+    ) -> Option<Range> {
+        let ranges = self.column_ranges_to_fetch.clone();
+        for (index, range) in ranges.iter().enumerate().rev() {
+            if self.is_schedulable(RequestKey::ColumnRange(*range), candidate_peers, now) {
+                return Some(self.column_ranges_to_fetch.remove(index));
+            }
+        }
+        None
+    }
+
     pub fn data_to_fetch(
         &mut self,
         target_slot: u64,
         current_epoch: u64,
         required_columns: &HashSet<u64>,
+        candidate_peers: &[PeerId],
+        now: Instant,
     ) -> DataToFetch {
-        match self.block_ranges_to_retry.pop() {
-            Some(range) => return DataToFetch::BlockRange(range),
-            None => {
-                let estimated_blocks_to_fetch = self.estimated_blocks_to_fetch();
-                if estimated_blocks_to_fetch > 0 && self.next_start_slot < target_slot {
-                    let blocks_to_fill = estimated_blocks_to_fetch
-                        .min(MAX_BLOCKS_PER_REQUEST.min(target_slot - self.next_start_slot));
-                    let start_slot = self.next_start_slot + 1;
-                    self.next_start_slot += blocks_to_fill;
-                    return DataToFetch::BlockRange(Range::new(start_slot, blocks_to_fill));
-                }
-            }
+        if let Some(range) = self.take_schedulable_retry_range(candidate_peers, now) {
+            return DataToFetch::BlockRange(range);
         }
 
-        if let Some(range) = self.column_ranges_to_fetch.pop() {
+        let estimated_blocks_to_fetch = self.estimated_blocks_to_fetch();
+        if estimated_blocks_to_fetch > 0 && self.next_start_slot < target_slot {
+            let blocks_to_fill = estimated_blocks_to_fetch
+                .min(MAX_BLOCKS_PER_REQUEST.min(target_slot - self.next_start_slot));
+            let start_slot = self.next_start_slot + 1;
+            self.next_start_slot += blocks_to_fill;
+            return DataToFetch::BlockRange(Range::new(start_slot, blocks_to_fill));
+        }
+
+        if let Some(range) = self.take_schedulable_column_range(candidate_peers, now) {
             return DataToFetch::DataColumnRange(range);
         }
 
         let mut block_roots_left_to_fetch = self.get_missing_block_roots();
         let missing_block_roots_len = block_roots_left_to_fetch.len();
-        block_roots_left_to_fetch.retain(|root| !self.block_roots_in_progress.contains(root));
+        block_roots_left_to_fetch.retain(|root| {
+            !self.block_roots_in_progress.contains(root)
+                && self.is_schedulable(RequestKey::BlockRoot(*root), candidate_peers, now)
+        });
 
         let mut blob_identifiers_left_to_fetch = self.get_missing_blob_identifiers(current_epoch);
         let missing_blob_identifiers_len = blob_identifiers_left_to_fetch.len();
-        blob_identifiers_left_to_fetch
-            .retain(|blob_identifier| !self.blob_identifiers_in_progress.contains(blob_identifier));
+        blob_identifiers_left_to_fetch.retain(|blob_identifier| {
+            !self.blob_identifiers_in_progress.contains(blob_identifier)
+                && self.is_schedulable(RequestKey::Blob(*blob_identifier), candidate_peers, now)
+        });
 
         let mut data_column_identifiers_left_to_fetch =
             self.get_missing_data_column_identifiers(current_epoch, required_columns);
@@ -267,6 +445,7 @@ impl BlockCache {
             !self
                 .data_column_identifiers_in_progress
                 .contains(identifier)
+                && self.is_schedulable(RequestKey::Column(*identifier), candidate_peers, now)
         });
 
         if !block_roots_left_to_fetch.is_empty() {
@@ -288,6 +467,8 @@ impl BlockCache {
             || missing_data_column_identifiers_len > 0
             || !self.block_ranges_in_progress.is_empty()
             || !self.column_ranges_in_progress.is_empty()
+            || !self.block_ranges_to_retry.is_empty()
+            || !self.column_ranges_to_fetch.is_empty()
         {
             return DataToFetch::DownloadsInProgress;
         }
@@ -398,6 +579,29 @@ impl BlockCache {
         }
         missing_identifiers
     }
+
+    pub fn expected_column_identifiers_in_range(
+        &self,
+        range: Range,
+        required_columns: &HashSet<u64>,
+    ) -> Vec<ColumnIdentifier> {
+        let range_end = range.start_slot + range.count;
+        let mut expected = Vec::new();
+        for block in self.blocks_and_blobs.values() {
+            if block.block.message.slot < range.start_slot || block.block.message.slot >= range_end
+            {
+                continue;
+            }
+            let block_root = block.block.message.tree_hash_root();
+            for column_index in required_columns {
+                let identifier = ColumnIdentifier::new(block_root, *column_index);
+                if !block.columns.contains_key(&identifier) {
+                    expected.push(identifier);
+                }
+            }
+        }
+        expected
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,7 +655,7 @@ mod tests {
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
         assert_eq!(
-            cache.data_to_fetch(10, 0, &HashSet::new()),
+            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now()),
             DataToFetch::Finished
         );
     }
@@ -466,13 +670,13 @@ mod tests {
         cache.mark_block_range_in_progress(range);
 
         assert_eq!(
-            cache.data_to_fetch(10, 0, &HashSet::new()),
+            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now()),
             DataToFetch::DownloadsInProgress
         );
 
         cache.remove_block_range_in_progress(&range);
         assert_eq!(
-            cache.data_to_fetch(10, 0, &HashSet::new()),
+            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now()),
             DataToFetch::Finished
         );
     }
@@ -483,15 +687,15 @@ mod tests {
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
         assert_eq!(
-            cache.data_to_fetch(25, 0, &HashSet::new()),
+            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now()),
             DataToFetch::BlockRange(Range::new(11, 10))
         );
         assert_eq!(
-            cache.data_to_fetch(25, 0, &HashSet::new()),
+            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now()),
             DataToFetch::BlockRange(Range::new(21, 5))
         );
         assert_eq!(
-            cache.data_to_fetch(25, 0, &HashSet::new()),
+            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now()),
             DataToFetch::Finished
         );
     }
@@ -531,7 +735,13 @@ mod tests {
             .add_blocks(vec![block_with_blob(boundary_slot)], false)
             .expect("boundary block should enter cache");
         assert_eq!(
-            retained.data_to_fetch(boundary_slot, current_epoch, &HashSet::new()),
+            retained.data_to_fetch(
+                boundary_slot,
+                current_epoch,
+                &HashSet::new(),
+                &[],
+                Instant::now()
+            ),
             DataToFetch::Finished
         );
 
@@ -541,7 +751,13 @@ mod tests {
             .add_blocks(vec![block_with_blob(expired_slot)], false)
             .expect("expired block should enter cache");
         assert_eq!(
-            expired.data_to_fetch(expired_slot, current_epoch, &HashSet::new()),
+            expired.data_to_fetch(
+                expired_slot,
+                current_epoch,
+                &HashSet::new(),
+                &[],
+                Instant::now()
+            ),
             DataToFetch::Finished
         );
     }
@@ -580,7 +796,13 @@ mod tests {
             .expect("boundary block should enter cache");
 
         let required_columns = HashSet::from([1, 5]);
-        match cache.data_to_fetch(boundary_slot, current_epoch, &required_columns) {
+        match cache.data_to_fetch(
+            boundary_slot,
+            current_epoch,
+            &required_columns,
+            &[],
+            Instant::now(),
+        ) {
             DataToFetch::MissingDataColumnIdentifiers(identifiers) => {
                 let mut identifiers = identifiers;
                 identifiers.sort();
@@ -597,7 +819,13 @@ mod tests {
 
         // Unneeded columns never count as missing.
         assert_eq!(
-            cache.data_to_fetch(boundary_slot, current_epoch, &HashSet::new()),
+            cache.data_to_fetch(
+                boundary_slot,
+                current_epoch,
+                &HashSet::new(),
+                &[],
+                Instant::now()
+            ),
             DataToFetch::Finished
         );
     }
@@ -656,6 +884,251 @@ mod tests {
             cache
                 .add_data_columns(vec![tampered], &required_columns)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn add_data_columns_is_atomic_a_bad_item_does_not_leave_earlier_items_mutated() {
+        use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
+
+        let blob = Blob::default();
+        let blob_bytes = blob.to_fixed_bytes();
+        let raw_commitment = das_context()
+            .blob_to_kzg_commitment(&blob_bytes)
+            .expect("test blob should produce a commitment");
+        let commitment = KZGCommitment(raw_commitment);
+
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+
+        let cells_and_kzg_proofs = compute_cells_and_kzg_proofs(&blob, das_context())
+            .expect("test blob should produce cells and proofs");
+        let columns = get_data_column_sidecars_from_block(&block, vec![cells_and_kzg_proofs])
+            .expect("test block should produce data columns");
+        let block_root = block.message.tree_hash_root();
+
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        cache
+            .add_blocks(vec![block], false)
+            .expect("block should enter cache");
+
+        let mut tampered = columns[1].clone();
+        tampered.kzg_proofs[0][0] ^= 1;
+        let required_columns = HashSet::from([0, 1]);
+
+        let result = cache.add_data_columns(vec![columns[0].clone(), tampered], &required_columns);
+        assert!(result.is_err(), "the batch as a whole must fail");
+
+        assert!(
+            cache
+                .blocks_and_blobs
+                .get(&block_root)
+                .expect("block should still be cached")
+                .columns
+                .is_empty(),
+            "a failed batch must not partially mutate the cache"
+        );
+    }
+
+    #[test]
+    fn is_schedulable_false_only_when_every_candidate_is_attempted() {
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        let key = RequestKey::BlockRoot(B256::repeat_byte(1));
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let candidates = [peer_a, peer_b];
+        let now = Instant::now();
+
+        assert!(cache.is_schedulable(key, &candidates, now));
+
+        cache.mark_attempted(key, peer_a, &candidates, now);
+        assert!(cache.is_schedulable(key, &candidates, now));
+
+        cache.mark_attempted(key, peer_b, &candidates, now);
+        assert!(!cache.is_schedulable(key, &candidates, now));
+    }
+
+    #[test]
+    fn cooldown_expiring_resets_the_attempted_set_for_a_fresh_round() {
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        let key = RequestKey::BlockRoot(B256::repeat_byte(1));
+        let peer_a = PeerId::random();
+        let candidates = [peer_a];
+        let now = Instant::now();
+
+        cache.mark_attempted(key, peer_a, &candidates, now);
+        assert!(!cache.is_schedulable(key, &candidates, now));
+
+        assert!(!cache.is_schedulable(key, &candidates, now + Duration::from_secs(1)));
+
+        assert!(cache.is_schedulable(
+            key,
+            &candidates,
+            now + ATTEMPT_COOLDOWN + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn a_new_peer_makes_an_exhausted_key_schedulable_without_waiting_for_cooldown() {
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        let key = RequestKey::BlockRoot(B256::repeat_byte(1));
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let now = Instant::now();
+
+        cache.mark_attempted(key, peer_a, &[peer_a], now);
+        assert!(!cache.is_schedulable(key, &[peer_a], now));
+
+        assert!(cache.is_schedulable(key, &[peer_a, peer_b], now));
+    }
+
+    #[test]
+    fn clear_attempted_starts_a_clean_round() {
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        let key = RequestKey::BlockRoot(B256::repeat_byte(1));
+        let peer_a = PeerId::random();
+        let now = Instant::now();
+
+        cache.mark_attempted(key, peer_a, &[peer_a], now);
+        assert!(!cache.is_schedulable(key, &[peer_a], now));
+
+        cache.clear_attempted(key);
+        assert!(cache.is_schedulable(key, &[peer_a], now));
+        assert!(cache.attempted_peers_for(key).is_empty());
+    }
+
+    #[test]
+    fn take_schedulable_retry_range_skips_backed_off_ranges_but_keeps_them_queued() {
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        let backed_off = Range::new(1, 10);
+        let schedulable = Range::new(11, 10);
+        let peer_a = PeerId::random();
+        let now = Instant::now();
+
+        cache.push_retry_range(backed_off);
+        cache.push_retry_range(schedulable);
+        cache.mark_attempted(RequestKey::BlockRange(backed_off), peer_a, &[peer_a], now);
+
+        assert_eq!(
+            cache.take_schedulable_retry_range(&[peer_a], now),
+            Some(schedulable)
+        );
+        assert_eq!(cache.block_ranges_to_retry, vec![backed_off]);
+        assert_eq!(cache.take_schedulable_retry_range(&[peer_a], now), None);
+    }
+
+    #[test]
+    fn an_exhausted_backed_off_root_does_not_starve_other_tiers_or_cause_false_finished() {
+        initialize_test_network_spec();
+        let parent_root = B256::repeat_byte(1);
+        let mut block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 1,
+                parent_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        block.message.parent_root = B256::repeat_byte(2);
+        let mut cache = BlockCache::new(parent_root, 1);
+        cache
+            .add_blocks(vec![block], false)
+            .expect("block should enter cache");
+
+        let peer_a = PeerId::random();
+        let now = Instant::now();
+        let missing_root = B256::repeat_byte(2);
+
+        cache.mark_attempted(RequestKey::BlockRoot(missing_root), peer_a, &[peer_a], now);
+
+        assert_eq!(
+            cache.data_to_fetch(1, 0, &HashSet::new(), &[peer_a], now),
+            DataToFetch::DownloadsInProgress
+        );
+    }
+
+    #[test]
+    fn data_to_fetch_filters_out_only_the_exhausted_root_not_the_whole_tier() {
+        initialize_test_network_spec();
+        let parent_root = B256::repeat_byte(1);
+        let root_a = B256::repeat_byte(2);
+        let root_b = B256::repeat_byte(3);
+        let block1 = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 1,
+                parent_root: root_a,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let block2 = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 2,
+                parent_root: root_b,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+
+        let mut cache = BlockCache::new(parent_root, 2);
+        cache
+            .add_blocks(vec![block1, block2], false)
+            .expect("blocks should enter cache");
+
+        let peer_a = PeerId::random();
+        let now = Instant::now();
+        cache.mark_attempted(RequestKey::BlockRoot(root_a), peer_a, &[peer_a], now);
+
+        match cache.data_to_fetch(2, 0, &HashSet::new(), &[peer_a], now) {
+            DataToFetch::MissingBlockRoots(roots) => {
+                assert_eq!(roots, vec![root_b]);
+            }
+            other => panic!("expected MissingBlockRoots, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_data_columns_drops_a_column_for_an_unknown_block_without_erroring_or_banning() {
+        use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
+
+        let blob = Blob::default();
+        let blob_bytes = blob.to_fixed_bytes();
+        let raw_commitment = das_context()
+            .blob_to_kzg_commitment(&blob_bytes)
+            .expect("test blob should produce a commitment");
+        let commitment = KZGCommitment(raw_commitment);
+
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+
+        let cells_and_kzg_proofs = compute_cells_and_kzg_proofs(&blob, das_context())
+            .expect("test blob should produce cells and proofs");
+        let columns = get_data_column_sidecars_from_block(&block, vec![cells_and_kzg_proofs])
+            .expect("test block should produce data columns");
+
+        let mut cache = BlockCache::new(B256::ZERO, 0);
+        let required_columns = HashSet::from([0]);
+        let result = cache.add_data_columns(vec![columns[0].clone()], &required_columns);
+
+        assert!(
+            result.is_ok(),
+            "a column for a block not yet in the cache must be dropped, not erroring the batch"
         );
     }
 }

@@ -1,5 +1,4 @@
 use alloy_primitives::B256;
-use anyhow::bail;
 use libp2p::PeerId;
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
@@ -7,9 +6,13 @@ use ream_consensus_beacon::{
     electra::beacon_block::SignedBeaconBlock,
 };
 use ream_executor::ReamExecutor;
-use ream_p2p::network::beacon::channel::{P2PCallbackResponse, P2PMessage, P2PRequest};
-use ream_req_resp::beacon::messages::{
-    BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier,
+use ream_p2p::network::beacon::channel::{
+    P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest,
+};
+use ream_req_resp::{
+    beacon::messages::{BeaconResponseMessage, data_column_sidecars::DataColumnsByRootIdentifier},
+    error::ReqRespError,
+    inbound_protocol::ResponseCode,
 };
 use tokio::{
     sync::mpsc::{self, UnboundedSender},
@@ -29,36 +32,68 @@ impl Range {
     }
 }
 
+#[derive(Debug)]
+pub enum DownloadFailure {
+    Transport(String),
+    InvalidData(String),
+    RemoteError { code: ResponseCode, message: String },
+}
+
+pub enum StreamOutcome<T> {
+    Complete(Vec<T>),
+    Failed(DownloadFailure),
+}
+
+fn classify_req_resp_error(err: ReqRespError) -> DownloadFailure {
+    match err {
+        ReqRespError::RemoteError { code, message } => {
+            DownloadFailure::RemoteError { code, message }
+        }
+        ReqRespError::InvalidData(message) => DownloadFailure::InvalidData(message),
+        other => DownloadFailure::Transport(format!("{other:?}")),
+    }
+}
+
 async fn drain_responses<T>(
-    mut rx: mpsc::Receiver<anyhow::Result<P2PCallbackResponse>>,
-    mut extract: impl FnMut(BeaconResponseMessage) -> Option<T>,
-) -> anyhow::Result<Vec<T>> {
+    mut rx: mpsc::Receiver<Result<P2PCallbackResponse, P2PCallbackError>>,
+    mut extract: impl FnMut(BeaconResponseMessage) -> Result<T, DownloadFailure>,
+) -> StreamOutcome<T> {
     let mut items = vec![];
 
     while let Some(response) = rx.recv().await {
         match response {
             Ok(P2PCallbackResponse::ResponseMessage(message)) => {
-                if let Some(item) = extract(message.as_ref().clone()) {
-                    items.push(item);
+                match extract(message.as_ref().clone()) {
+                    Ok(item) => items.push(item),
+                    Err(err) => return StreamOutcome::Failed(err),
                 }
             }
             Ok(P2PCallbackResponse::EndOfStream) => {
                 info!("End of request stream received.");
-                break;
+                return StreamOutcome::Complete(items);
             }
             Ok(P2PCallbackResponse::Disconnected) => {
-                bail!("Peer disconnected while receiving response.");
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "peer disconnected while receiving response".to_string(),
+                ));
             }
             Ok(P2PCallbackResponse::Timeout) => {
-                bail!("Request timed out.");
+                return StreamOutcome::Failed(DownloadFailure::Transport(
+                    "request timed out".to_string(),
+                ));
             }
-            Err(err) => {
-                info!("Error receiving response: {err:?}");
+            Err(P2PCallbackError::ReqResp(err)) => {
+                return StreamOutcome::Failed(classify_req_resp_error(err));
+            }
+            Err(P2PCallbackError::Other(err)) => {
+                return StreamOutcome::Failed(DownloadFailure::Transport(format!("{err:?}")));
             }
         }
     }
 
-    Ok(items)
+    StreamOutcome::Failed(DownloadFailure::Transport(
+        "channel closed before EndOfStream".to_string(),
+    ))
 }
 
 pub struct PeerRangeDownloader;
@@ -69,7 +104,7 @@ impl PeerRangeDownloader {
         p2p_sender: UnboundedSender<P2PMessage>,
         executor: ReamExecutor,
         range: Range,
-    ) -> JoinHandle<anyhow::Result<anyhow::Result<Vec<SignedBeaconBlock>>>> {
+    ) -> JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
             p2p_sender
@@ -82,8 +117,10 @@ impl PeerRangeDownloader {
                 .expect("Failed to send block range request");
 
             drain_responses(rx, |message| match message {
-                BeaconResponseMessage::BeaconBlocksByRange(block) => Some(block),
-                _ => None,
+                BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+                other => Err(DownloadFailure::InvalidData(format!(
+                    "unexpected response variant for a BlockRange request: {other:?}"
+                ))),
             })
             .await
         })
@@ -98,7 +135,7 @@ impl PeerRootsDownloader {
         p2p_sender: UnboundedSender<P2PMessage>,
         executor: ReamExecutor,
         roots: Vec<B256>,
-    ) -> JoinHandle<anyhow::Result<anyhow::Result<Vec<SignedBeaconBlock>>>> {
+    ) -> JoinHandle<anyhow::Result<StreamOutcome<SignedBeaconBlock>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
             p2p_sender
@@ -110,8 +147,10 @@ impl PeerRootsDownloader {
                 .expect("Failed to send block roots request");
 
             drain_responses(rx, |message| match message {
-                BeaconResponseMessage::BeaconBlocksByRoot(block) => Some(block),
-                _ => None,
+                BeaconResponseMessage::BeaconBlocksByRoot(block) => Ok(block),
+                other => Err(DownloadFailure::InvalidData(format!(
+                    "unexpected response variant for a BlockRoots request: {other:?}"
+                ))),
             })
             .await
         })
@@ -126,7 +165,7 @@ impl PeerBlobIdentifierDownloader {
         p2p_sender: UnboundedSender<P2PMessage>,
         executor: ReamExecutor,
         blob_identifiers: Vec<BlobIdentifier>,
-    ) -> JoinHandle<anyhow::Result<anyhow::Result<Vec<BlobSidecar>>>> {
+    ) -> JoinHandle<anyhow::Result<StreamOutcome<BlobSidecar>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
             p2p_sender
@@ -138,8 +177,10 @@ impl PeerBlobIdentifierDownloader {
                 .expect("Failed to send blob identifiers request");
 
             drain_responses(rx, |message| match message {
-                BeaconResponseMessage::BlobSidecarsByRoot(blob_sidecar) => Some(blob_sidecar),
-                _ => None,
+                BeaconResponseMessage::BlobSidecarsByRoot(blob_sidecar) => Ok(blob_sidecar),
+                other => Err(DownloadFailure::InvalidData(format!(
+                    "unexpected response variant for a BlobIdentifiers request: {other:?}"
+                ))),
             })
             .await
         })
@@ -155,7 +196,7 @@ impl PeerDataColumnRangeDownloader {
         executor: ReamExecutor,
         range: Range,
         columns: Vec<u64>,
-    ) -> JoinHandle<anyhow::Result<anyhow::Result<Vec<DataColumnSidecar>>>> {
+    ) -> JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
             p2p_sender
@@ -169,8 +210,10 @@ impl PeerDataColumnRangeDownloader {
                 .expect("Failed to send data column range request");
 
             drain_responses(rx, |message| match message {
-                BeaconResponseMessage::DataColumnSidecarsByRange(column) => Some(column),
-                _ => None,
+                BeaconResponseMessage::DataColumnSidecarsByRange(column) => Ok(column),
+                other => Err(DownloadFailure::InvalidData(format!(
+                    "unexpected response variant for a DataColumnRange request: {other:?}"
+                ))),
             })
             .await
         })
@@ -185,7 +228,7 @@ impl PeerDataColumnIdentifierDownloader {
         p2p_sender: UnboundedSender<P2PMessage>,
         executor: ReamExecutor,
         identifiers: Vec<DataColumnsByRootIdentifier>,
-    ) -> JoinHandle<anyhow::Result<anyhow::Result<Vec<DataColumnSidecar>>>> {
+    ) -> JoinHandle<anyhow::Result<StreamOutcome<DataColumnSidecar>>> {
         executor.spawn(async move {
             let (callback, rx) = mpsc::channel(100);
             p2p_sender
@@ -197,8 +240,10 @@ impl PeerDataColumnIdentifierDownloader {
                 .expect("Failed to send data column identifiers request");
 
             drain_responses(rx, |message| match message {
-                BeaconResponseMessage::DataColumnSidecarsByRoot(column) => Some(column),
-                _ => None,
+                BeaconResponseMessage::DataColumnSidecarsByRoot(column) => Ok(column),
+                other => Err(DownloadFailure::InvalidData(format!(
+                    "unexpected response variant for a DataColumnIdentifiers request: {other:?}"
+                ))),
             })
             .await
         })
@@ -219,16 +264,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_responses_extracts_matching_and_ignores_other_variants() {
+    async fn drain_responses_rejects_an_unexpected_variant_as_invalid_data() {
         let (tx, rx) = mpsc::channel(10);
         tx.send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
             BeaconResponseMessage::BeaconBlocksByRange(test_block()),
         ))))
         .await
         .expect("send should succeed");
-        // A response for a different request kind must be ignored, not collected or errored on.
         tx.send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
             BeaconResponseMessage::BeaconBlocksByRoot(test_block()),
+        ))))
+        .await
+        .expect("send should succeed");
+
+        let outcome = drain_responses(rx, |message| match message {
+            BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+            other => Err(DownloadFailure::InvalidData(format!(
+                "unexpected: {other:?}"
+            ))),
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            StreamOutcome::Failed(DownloadFailure::InvalidData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_responses_completes_on_clean_end_of_stream() {
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
+            BeaconResponseMessage::BeaconBlocksByRange(test_block()),
         ))))
         .await
         .expect("send should succeed");
@@ -236,18 +303,22 @@ mod tests {
             .await
             .expect("send should succeed");
 
-        let items = drain_responses(rx, |message| match message {
-            BeaconResponseMessage::BeaconBlocksByRange(block) => Some(block),
-            _ => None,
+        let outcome = drain_responses(rx, |message| match message {
+            BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+            other => Err(DownloadFailure::InvalidData(format!(
+                "unexpected: {other:?}"
+            ))),
         })
-        .await
-        .expect("drain should succeed");
+        .await;
 
+        let StreamOutcome::Complete(items) = outcome else {
+            panic!("expected a complete outcome");
+        };
         assert_eq!(items.len(), 1);
     }
 
     #[tokio::test]
-    async fn drain_responses_returns_collected_items_when_channel_closes() {
+    async fn drain_responses_treats_channel_close_without_end_of_stream_as_transport_failure() {
         let (tx, rx) = mpsc::channel(10);
         tx.send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
             BeaconResponseMessage::BeaconBlocksByRange(test_block()),
@@ -256,45 +327,83 @@ mod tests {
         .expect("send should succeed");
         drop(tx);
 
-        let items = drain_responses(rx, |message| match message {
-            BeaconResponseMessage::BeaconBlocksByRange(block) => Some(block),
-            _ => None,
+        let outcome = drain_responses(rx, |message| match message {
+            BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+            other => Err(DownloadFailure::InvalidData(format!(
+                "unexpected: {other:?}"
+            ))),
         })
-        .await
-        .expect("drain should succeed");
+        .await;
 
-        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            outcome,
+            StreamOutcome::Failed(DownloadFailure::Transport(_))
+        ));
     }
 
     #[tokio::test]
-    async fn drain_responses_fails_on_disconnect() {
+    async fn drain_responses_fails_on_disconnect_without_banning() {
         let (tx, rx) = mpsc::channel(10);
         tx.send(Ok(P2PCallbackResponse::Disconnected))
             .await
             .expect("send should succeed");
 
-        let result = drain_responses(rx, |message| match message {
-            BeaconResponseMessage::BeaconBlocksByRange(block) => Some(block),
-            _ => None,
+        let outcome = drain_responses(rx, |message| match message {
+            BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+            other => Err(DownloadFailure::InvalidData(format!(
+                "unexpected: {other:?}"
+            ))),
         })
         .await;
 
-        assert!(result.is_err());
+        assert!(matches!(
+            outcome,
+            StreamOutcome::Failed(DownloadFailure::Transport(_))
+        ));
     }
 
     #[tokio::test]
-    async fn drain_responses_fails_on_timeout() {
+    async fn drain_responses_fails_on_timeout_without_banning() {
         let (tx, rx) = mpsc::channel(10);
         tx.send(Ok(P2PCallbackResponse::Timeout))
             .await
             .expect("send should succeed");
 
-        let result = drain_responses(rx, |message| match message {
-            BeaconResponseMessage::BeaconBlocksByRange(block) => Some(block),
-            _ => None,
+        let outcome = drain_responses(rx, |message| match message {
+            BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+            other => Err(DownloadFailure::InvalidData(format!(
+                "unexpected: {other:?}"
+            ))),
         })
         .await;
 
-        assert!(result.is_err());
+        assert!(matches!(
+            outcome,
+            StreamOutcome::Failed(DownloadFailure::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_responses_classifies_remote_error_separately_from_invalid_data() {
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(Err(P2PCallbackError::ReqResp(ReqRespError::RemoteError {
+            code: ResponseCode::ResourceUnavailable,
+            message: "no data for this range".to_string(),
+        })))
+        .await
+        .expect("send should succeed");
+
+        let outcome = drain_responses(rx, |message| match message {
+            BeaconResponseMessage::BeaconBlocksByRange(block) => Ok(block),
+            other => Err(DownloadFailure::InvalidData(format!(
+                "unexpected: {other:?}"
+            ))),
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            StreamOutcome::Failed(DownloadFailure::RemoteError { .. })
+        ));
     }
 }

@@ -540,7 +540,7 @@ impl NetworkManagerService {
                 result = &mut syncer_handle, if syncer_active => {
                     syncer_active = false;
                     match result {
-                        Ok(Ok((block_range_syncer, sync_result))) => {
+                        Ok(Ok((mut block_range_syncer, sync_result))) => {
                             if let Err(err) = sync_result {
                                 warn!("Block range sync segment failed: {err:?}");
                             }
@@ -570,7 +570,7 @@ impl NetworkManagerService {
                     }
                 }
                 _ = resync_check_interval.tick(), if !syncer_active && idle_syncer.is_some() => {
-                    let block_range_syncer = idle_syncer
+                    let mut block_range_syncer = idle_syncer
                         .take()
                         .expect("checked by the select guard above");
                     if block_range_syncer.is_synced_to_head_slot().await {

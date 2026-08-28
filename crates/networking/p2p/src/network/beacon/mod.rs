@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use channel::{P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
+use channel::{P2PCallbackError, P2PCallbackResponse, P2PMessage, P2PRequest, P2PResponse};
 use delay_map::{HashMapDelay, HashSetDelay};
 use discv5::Enr;
 use libp2p::{
@@ -109,7 +109,7 @@ pub struct Network {
     peer_id: PeerId,
     swarm: Swarm<ReamBehaviour>,
     subscribed_topics: Arc<Mutex<HashSet<GossipTopic>>>,
-    callbacks: HashMapDelay<u64, mpsc::Sender<anyhow::Result<P2PCallbackResponse>>>,
+    callbacks: HashMapDelay<u64, mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>>>,
     request_id: u64,
     network_state: Arc<NetworkState>,
     peers_to_ping: HashSetDelay<PeerId>,
@@ -687,9 +687,9 @@ impl Network {
         let message = match message {
             Ok(message) => message,
             Err(err) => {
-                if let ReqRespMessageError::Outbound { request_id, .. } = &err
-                    && let Some(callback) = self.callbacks.get(request_id)
-                    && let Err(err) = callback.send(Err(anyhow!("{err:?}"))).await
+                if let ReqRespMessageError::Outbound { request_id, err } = err
+                    && let Some(callback) = self.callbacks.remove(&request_id)
+                    && let Err(err) = callback.send(Err(P2PCallbackError::ReqResp(err))).await
                 {
                     warn!("Failed to send error response: {err:?}");
                 }
