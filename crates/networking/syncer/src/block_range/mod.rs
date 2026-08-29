@@ -62,6 +62,14 @@ const ZERO_PROGRESS_BACKOFF: Duration = Duration::from_secs(30);
 
 const CANDIDATE_EXHAUSTION_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn should_abort_for_candidate_exhaustion(elapsed: Duration, tasks_in_flight: bool) -> bool {
+    elapsed >= CANDIDATE_EXHAUSTION_TIMEOUT && !tasks_in_flight
+}
+
+fn candidate_exhaustion_deserves_backoff(target_slot: u64, head_slot: u64) -> bool {
+    target_slot > head_slot
+}
+
 /// Validates downloaded blob sidecars and derives the columns needed for data availability.
 /// An empty `blob_sidecars` map defers to the block-lookup coordinator instead of erroring,
 /// since range sync never fetches legacy blob sidecars for post-Fulu blocks.
@@ -250,7 +258,6 @@ impl BlockRangeSyncer {
         let mut finalized_phase_settled = false;
         let mut finalized_target_was_ahead = false;
         let mut candidate_exhausted_since: Option<Instant> = None;
-        let mut ended_due_to_candidate_exhaustion = false;
 
         loop {
             self.peer_manager.update_peer_set();
@@ -344,19 +351,6 @@ impl BlockRangeSyncer {
 
             let candidate_peers = self.peer_manager.peers_satisfying(target.qualification);
 
-            if candidate_peers.is_empty() {
-                let exhausted_since = *candidate_exhausted_since.get_or_insert_with(Instant::now);
-                if exhausted_since.elapsed() >= CANDIDATE_EXHAUSTION_TIMEOUT {
-                    info!(
-                        "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this segment."
-                    );
-                    ended_due_to_candidate_exhaustion = true;
-                    break;
-                }
-            } else {
-                candidate_exhausted_since = None;
-            }
-
             let now = Instant::now();
             poll_ready_tasks(
                 &mut task_handles,
@@ -367,6 +361,24 @@ impl BlockRangeSyncer {
                 &candidate_peers,
                 now,
             )?;
+
+            if candidate_peers.is_empty() {
+                let exhausted_since = *candidate_exhausted_since.get_or_insert_with(Instant::now);
+                if should_abort_for_candidate_exhaustion(
+                    exhausted_since.elapsed(),
+                    !task_handles.is_empty(),
+                ) {
+                    info!(
+                        "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this segment."
+                    );
+                    if candidate_exhaustion_deserves_backoff(target.slot, head_slot) {
+                        self.next_segment_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
+                    }
+                    break;
+                }
+            } else {
+                candidate_exhausted_since = None;
+            }
 
             let current_epoch = self
                 .beacon_chain
@@ -701,10 +713,7 @@ impl BlockRangeSyncer {
             || active_target
                 .as_ref()
                 .is_some_and(|target| target.slot > head_slot);
-        if target_was_ahead
-            && (saw_empty_range || ended_due_to_candidate_exhaustion)
-            && imported_count == 0
-        {
+        if target_was_ahead && saw_empty_range && imported_count == 0 {
             self.next_segment_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
         }
 
@@ -1106,12 +1115,14 @@ fn poll_ready_tasks(
                         };
 
                         let requested: HashSet<B256> = roots.iter().copied().collect();
-                        let has_unexpected = blocks
-                            .iter()
-                            .any(|block| !requested.contains(&block.message.tree_hash_root()));
+                        let mut seen_roots = HashSet::new();
+                        let has_unexpected = blocks.iter().any(|block| {
+                            let root = block.message.tree_hash_root();
+                            !requested.contains(&root) || !seen_roots.insert(root)
+                        });
                         if has_unexpected {
                             warn!(
-                                "Peer {peer_id} returned block(s) with an unrequested root for a BlockRoots request"
+                                "Peer {peer_id} returned an unrequested or duplicate root for a BlockRoots request"
                             );
                             for root in roots.iter() {
                                 block_cache.mark_attempted(
@@ -1201,14 +1212,18 @@ fn poll_ready_tasks(
 
                         let requested: HashSet<BlobIdentifier> =
                             blob_identifiers.iter().copied().collect();
+                        let mut seen_identifiers = HashSet::new();
                         let has_unexpected = blob_sidecars.iter().any(|sidecar| {
-                            !requested.contains(&BlobIdentifier {
+                            let identifier = BlobIdentifier {
                                 block_root: sidecar.signed_block_header.message.tree_hash_root(),
                                 index: sidecar.index,
-                            })
+                            };
+                            !requested.contains(&identifier) || !seen_identifiers.insert(identifier)
                         });
                         if has_unexpected {
-                            warn!("Peer {peer_id} returned unrequested blob sidecar(s)");
+                            warn!(
+                                "Peer {peer_id} returned an unrequested or duplicate blob sidecar"
+                            );
                             for identifier in blob_identifiers.iter() {
                                 block_cache.mark_attempted(
                                     RequestKey::Blob(*identifier),
@@ -1305,14 +1320,18 @@ fn poll_ready_tasks(
 
                         let requested: HashSet<ColumnIdentifier> =
                             identifiers.iter().copied().collect();
+                        let mut seen_identifiers = HashSet::new();
                         let has_unexpected = columns.iter().any(|column| {
-                            !requested.contains(&ColumnIdentifier::new(
+                            let identifier = ColumnIdentifier::new(
                                 column.signed_block_header.message.tree_hash_root(),
                                 column.index,
-                            ))
+                            );
+                            !requested.contains(&identifier) || !seen_identifiers.insert(identifier)
                         });
                         if has_unexpected {
-                            warn!("Peer {peer_id} returned unrequested data column(s)");
+                            warn!(
+                                "Peer {peer_id} returned an unrequested or duplicate data column"
+                            );
                             for identifier in identifiers.iter() {
                                 block_cache.mark_attempted(
                                     RequestKey::Column(*identifier),
@@ -1405,6 +1424,33 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn should_abort_for_candidate_exhaustion_waits_for_the_timeout() {
+        assert!(!should_abort_for_candidate_exhaustion(
+            CANDIDATE_EXHAUSTION_TIMEOUT - Duration::from_secs(1),
+            false,
+        ));
+        assert!(should_abort_for_candidate_exhaustion(
+            CANDIDATE_EXHAUSTION_TIMEOUT,
+            false,
+        ));
+    }
+
+    #[test]
+    fn should_abort_for_candidate_exhaustion_never_fires_with_a_task_still_in_flight() {
+        assert!(!should_abort_for_candidate_exhaustion(
+            CANDIDATE_EXHAUSTION_TIMEOUT + Duration::from_secs(60),
+            true,
+        ));
+    }
+
+    #[test]
+    fn candidate_exhaustion_deserves_backoff_only_when_the_target_was_ahead() {
+        assert!(candidate_exhaustion_deserves_backoff(100, 50));
+        assert!(!candidate_exhaustion_deserves_backoff(50, 50));
+        assert!(!candidate_exhaustion_deserves_backoff(50, 100));
+    }
 
     #[test]
     fn range_blob_sidecars_build_valid_columns_and_reject_bad_proofs() {
@@ -1766,6 +1812,62 @@ mod tests {
     }
 
     #[test]
+    fn poll_ready_tasks_duplicate_block_root_bans_peer_and_discards_whole_batch() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let block_a = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 1,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let requested_root = block_a.message.tree_hash_root();
+        let block_b = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 1,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        let handle = executor.spawn(async move { StreamOutcome::Complete(vec![block_a, block_b]) });
+        let mut tasks = vec![DownloadTask::new_block_roots(
+            handle,
+            vec![requested_root],
+            peer_id,
+        )];
+
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::new(),
+            &mut false,
+            &[peer_id],
+        );
+
+        assert_eq!(
+            block_cache.block_count(),
+            0,
+            "a response returning the same requested root twice is atomically discarded"
+        );
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::BlockRoot(requested_root))
+                .contains(&peer_id),
+            "the requested root must still be attributed to this peer's failed attempt"
+        );
+        assert!(
+            peer_manager.fetch_idle_peer_from(&[peer_id]).is_none(),
+            "a peer that returned a duplicate item must be banned, not just marked idle"
+        );
+    }
+
+    #[test]
     fn poll_ready_tasks_empty_data_column_range_falls_through_to_by_root_and_excludes_peer() {
         initialize_test_network_spec();
         let executor = ReamExecutor::new().expect("executor should start");
@@ -1876,6 +1978,144 @@ mod tests {
         assert!(
             peer_manager.fetch_idle_peer_from(&[peer_id]).is_none(),
             "a peer that served an invalid blob proof must be banned, not just marked idle"
+        );
+    }
+
+    #[test]
+    fn poll_ready_tasks_duplicate_blob_identifier_bans_peer_and_discards_whole_batch() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let blob = Blob::default();
+        let blob_bytes = blob.to_fixed_bytes();
+        let raw_commitment = das_context()
+            .blob_to_kzg_commitment(&blob_bytes)
+            .expect("test blob should produce a commitment");
+        let commitment = KZGCommitment(raw_commitment);
+        let proof = KZGProof::from(
+            compute_blob_kzg_proof_raw(
+                blob_bytes,
+                raw_commitment,
+                ream_polynomial_commitments::trusted_setup::blst_settings(),
+            )
+            .expect("test blob should produce a proof")
+            .to_bytes(),
+        );
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let block_root = block.message.tree_hash_root();
+        let identifier = BlobIdentifier::new(block_root, 0);
+        let sidecar = block
+            .blob_sidecar(BlobAndProofV1 { blob, proof }, 0)
+            .expect("test sidecar should be constructed");
+
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        block_cache
+            .add_blocks(vec![block], false)
+            .expect("block should enter cache");
+
+        let handle =
+            executor.spawn(async move { StreamOutcome::Complete(vec![sidecar.clone(), sidecar]) });
+        let mut tasks = vec![DownloadTask::new_blob_identifiers(
+            handle,
+            vec![identifier],
+            peer_id,
+        )];
+
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::new(),
+            &mut false,
+            &[peer_id],
+        );
+
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::Blob(identifier))
+                .contains(&peer_id),
+            "the requested identifier must still be attributed to this peer's failed attempt"
+        );
+        assert!(
+            peer_manager.fetch_idle_peer_from(&[peer_id]).is_none(),
+            "a peer that returned a duplicate blob sidecar must be banned, not just marked idle"
+        );
+    }
+
+    #[test]
+    fn poll_ready_tasks_duplicate_data_column_bans_peer_and_discards_whole_batch() {
+        use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
+
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let blob = Blob::default();
+        let blob_bytes = blob.to_fixed_bytes();
+        let raw_commitment = das_context()
+            .blob_to_kzg_commitment(&blob_bytes)
+            .expect("test blob should produce a commitment");
+        let commitment = KZGCommitment(raw_commitment);
+        let mut block = SignedBeaconBlock {
+            message: Default::default(),
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .blob_kzg_commitments
+            .push(commitment)
+            .expect("one commitment should fit");
+        let block_root = block.message.tree_hash_root();
+
+        let cells_and_kzg_proofs = compute_cells_and_kzg_proofs(&blob, das_context())
+            .expect("test blob should produce cells and proofs");
+        let columns = get_data_column_sidecars_from_block(&block, vec![cells_and_kzg_proofs])
+            .expect("test block should produce data columns");
+        let column = columns[0].clone();
+        let identifier = ColumnIdentifier::new(block_root, column.index);
+
+        let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        block_cache
+            .add_blocks(vec![block], false)
+            .expect("block should enter cache");
+
+        let handle =
+            executor.spawn(async move { StreamOutcome::Complete(vec![column.clone(), column]) });
+        let mut tasks = vec![DownloadTask::new_data_column_identifiers(
+            handle,
+            vec![identifier],
+            peer_id,
+        )];
+
+        poll_until_done(
+            &mut tasks,
+            &mut block_cache,
+            &mut peer_manager,
+            &HashSet::from([identifier.index]),
+            &mut false,
+            &[peer_id],
+        );
+
+        assert!(
+            block_cache
+                .attempted_peers_for(RequestKey::Column(identifier))
+                .contains(&peer_id),
+            "the requested identifier must still be attributed to this peer's failed attempt"
+        );
+        assert!(
+            peer_manager.fetch_idle_peer_from(&[peer_id]).is_none(),
+            "a peer that returned a duplicate data column must be banned, not just marked idle"
         );
     }
 }
