@@ -32,7 +32,7 @@ pub fn sign_voluntary_exit(
                     &voluntary_exit,
                     compute_domain(
                         DOMAIN_VOLUNTARY_EXIT,
-                        Some(beacon_network_spec().electra_fork_version),
+                        Some(beacon_network_spec().current_fork_version(epoch)),
                         None,
                     ),
                 )

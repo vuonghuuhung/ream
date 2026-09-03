@@ -169,9 +169,10 @@ pub fn sign_attestation_data(
     attestation_data: &AttestationData,
     private_key: &PrivateKey,
 ) -> anyhow::Result<BLSSignature> {
+    let epoch = compute_epoch_at_slot(attestation_data.slot);
     let domain = compute_domain(
         DOMAIN_BEACON_ATTESTER,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(attestation_data, domain);
@@ -179,9 +180,10 @@ pub fn sign_attestation_data(
 }
 
 pub fn get_selection_proof(slot: u64, private_key: &PrivateKey) -> anyhow::Result<BLSSignature> {
+    let epoch = compute_epoch_at_slot(slot);
     let domain = compute_domain(
         DOMAIN_SELECTION_PROOF,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(slot, domain);

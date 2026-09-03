@@ -148,9 +148,10 @@ pub fn get_sync_committee_selection_proof(
     subcommittee_index: u64,
     private_key: &PrivateKey,
 ) -> anyhow::Result<BLSSignature> {
+    let epoch = compute_epoch_at_slot(slot);
     let domain = compute_domain(
         DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(

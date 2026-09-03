@@ -27,9 +27,10 @@ pub fn sign_beacon_block(
     beacon_block: BeaconBlock,
     private_key: &PrivateKey,
 ) -> anyhow::Result<SignedBeaconBlock> {
+    let epoch = compute_epoch_at_slot(beacon_block.slot);
     let domain = compute_domain(
         DOMAIN_BEACON_PROPOSER,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(&beacon_block, domain);
@@ -45,9 +46,10 @@ pub fn sign_blinded_beacon_block(
     blinded_beacon_block: BlindedBeaconBlock,
     private_key: &PrivateKey,
 ) -> anyhow::Result<SignedBlindedBeaconBlock> {
+    let epoch = compute_epoch_at_slot(blinded_beacon_block.slot);
     let domain = compute_domain(
         DOMAIN_BEACON_PROPOSER,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(&blinded_beacon_block, domain);

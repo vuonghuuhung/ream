@@ -1,7 +1,7 @@
 use ream_bls::{BLSSignature, PrivateKey, traits::Signable};
 use ream_consensus_misc::{
     constants::beacon::genesis_validators_root,
-    misc::{compute_domain, compute_signing_root},
+    misc::{compute_domain, compute_epoch_at_slot, compute_signing_root},
 };
 pub use ream_events_beacon::contribution_and_proof::{
     ContributionAndProof, SyncCommitteeContribution,
@@ -32,9 +32,10 @@ pub fn get_contribution_and_proof_signature(
     contribution_and_proof: &ContributionAndProof,
     private_key: &PrivateKey,
 ) -> anyhow::Result<BLSSignature> {
+    let epoch = compute_epoch_at_slot(contribution_and_proof.contribution.slot);
     let domain = compute_domain(
         DOMAIN_CONTRIBUTION_AND_PROOF,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(contribution_and_proof, domain);

@@ -56,9 +56,10 @@ pub fn sign_aggregate_and_proof(
     aggregate_and_proof: &AggregateAndProof,
     private_key: &PrivateKey,
 ) -> anyhow::Result<BLSSignature> {
+    let epoch = compute_epoch_at_slot(aggregate_and_proof.aggregate.data.slot);
     let domain = compute_domain(
         DOMAIN_AGGREGATE_AND_PROOF,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(aggregate_and_proof, domain);

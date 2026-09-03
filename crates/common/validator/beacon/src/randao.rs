@@ -10,7 +10,7 @@ pub fn sign_randao_reveal(slot: u64, private_key: &PrivateKey) -> anyhow::Result
 
     let domain = compute_domain(
         DOMAIN_RANDAO,
-        Some(beacon_network_spec().electra_fork_version),
+        Some(beacon_network_spec().current_fork_version(epoch)),
         Some(genesis_validators_root()),
     );
     let signing_root = compute_signing_root(epoch, domain);

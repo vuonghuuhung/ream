@@ -530,9 +530,10 @@ impl ValidatorService {
         slot: u64,
         validator_indices: &[u64],
     ) -> anyhow::Result<()> {
+        let epoch = compute_epoch_at_slot(slot);
         let domain = compute_domain(
             DOMAIN_SYNC_COMMITTEE,
-            Some(beacon_network_spec().electra_fork_version),
+            Some(beacon_network_spec().current_fork_version(epoch)),
             Some(genesis_validators_root()),
         );
         let beacon_block_root = self
