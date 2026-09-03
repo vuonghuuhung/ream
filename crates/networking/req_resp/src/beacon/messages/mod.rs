@@ -110,14 +110,17 @@ impl BeaconRequestMessage {
                 request.count.min(MAX_REQUEST_BLOCKS)
             }
             BeaconRequestMessage::BeaconBlocksByRoot(request) => request.inner.len() as u64,
-            BeaconRequestMessage::BlobSidecarsByRange(request) => {
-                (request.count * MAX_BLOBS_PER_BLOCK).min(MAX_REQUEST_BLOB_SIDECARS)
-            }
+            BeaconRequestMessage::BlobSidecarsByRange(request) => request
+                .count
+                .saturating_mul(MAX_BLOBS_PER_BLOCK)
+                .min(MAX_REQUEST_BLOB_SIDECARS),
             BeaconRequestMessage::BlobSidecarsByRoot(request) => request.inner.len() as u64,
             BeaconRequestMessage::DataColumnSidecarsByRange(request) => {
                 let num_columns = request.columns.len() as u64;
-                (request.count * num_columns)
-                    .min(MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN * num_columns)
+                request
+                    .count
+                    .saturating_mul(num_columns)
+                    .min(MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN.saturating_mul(num_columns))
             }
             BeaconRequestMessage::DataColumnSidecarsByRoot(request) => {
                 request.inner.iter().map(|id| id.columns.len() as u64).sum()

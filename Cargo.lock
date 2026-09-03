@@ -7184,6 +7184,7 @@ dependencies = [
  "ream-consensus-misc",
  "ream-execution-rpc-types",
  "ream-executor",
+ "ream-fork-choice-beacon",
  "ream-network-spec",
  "ream-operation-pool",
  "ream-p2p",

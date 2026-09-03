@@ -7,6 +7,7 @@ use std::{
 use libp2p::PeerId;
 use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
 use ream_p2p::network::beacon::{network_state::NetworkState, peer::CachedPeer};
+use ream_req_resp::beacon::messages::status::Status;
 use tracing::warn;
 
 /// How long a peer stays banned before it becomes eligible to rejoin the peer set.
@@ -58,6 +59,8 @@ pub enum PeerStatus {
 pub struct PeerInfo {
     pub peer: CachedPeer,
     pub peer_status: PeerStatus,
+    pub processed_blocks: u64,
+    pub sync_requests_started: u64,
 }
 
 pub struct PeerManager {
@@ -98,6 +101,8 @@ impl PeerManager {
                     entry.insert(PeerInfo {
                         peer: peer.clone(),
                         peer_status: PeerStatus::Idle,
+                        processed_blocks: 0,
+                        sync_requests_started: 0,
                     });
                 }
             }
@@ -118,26 +123,32 @@ impl PeerManager {
         }
     }
 
+    fn reserve(&mut self, peer_id: &PeerId) -> Option<CachedPeer> {
+        let peer_info = self.peers.get_mut(peer_id)?;
+        if !matches!(peer_info.peer_status, PeerStatus::Idle) {
+            return None;
+        }
+        peer_info.peer_status = PeerStatus::Downloading;
+        peer_info.sync_requests_started += 1;
+        Some(peer_info.peer.clone())
+    }
+
     /// Fetches an idle peer from the peer set.
     ///
     /// Will set the peer status to `Downloading` if an idle peer is found.
     pub fn fetch_idle_peer(&mut self) -> Option<CachedPeer> {
-        for peer_info in self.peers.values_mut() {
-            if let PeerStatus::Idle = peer_info.peer_status {
-                peer_info.peer_status = PeerStatus::Downloading;
-                return Some(peer_info.peer.clone());
-            }
-        }
-        None
+        let idle_peer_id = self
+            .peers
+            .iter()
+            .find(|(_, peer_info)| matches!(peer_info.peer_status, PeerStatus::Idle))
+            .map(|(peer_id, _)| *peer_id)?;
+        self.reserve(&idle_peer_id)
     }
 
     pub fn fetch_idle_peer_from(&mut self, eligible: &[PeerId]) -> Option<CachedPeer> {
         for peer_id in eligible {
-            if let Some(peer_info) = self.peers.get_mut(peer_id)
-                && matches!(peer_info.peer_status, PeerStatus::Idle)
-            {
-                peer_info.peer_status = PeerStatus::Downloading;
-                return Some(peer_info.peer.clone());
+            if let Some(peer) = self.reserve(peer_id) {
+                return Some(peer);
             }
         }
         None
@@ -152,11 +163,8 @@ impl PeerManager {
             if excluded.contains(peer_id) {
                 continue;
             }
-            if let Some(peer_info) = self.peers.get_mut(peer_id)
-                && matches!(peer_info.peer_status, PeerStatus::Idle)
-            {
-                peer_info.peer_status = PeerStatus::Downloading;
-                return Some(peer_info.peer.clone());
+            if let Some(peer) = self.reserve(peer_id) {
+                return Some(peer);
             }
         }
         None
@@ -181,6 +189,12 @@ impl PeerManager {
     pub fn mark_peer_as_idle(&mut self, peer_id: &PeerId) {
         if let Some(peer_info) = self.peers.get_mut(peer_id) {
             peer_info.peer_status = PeerStatus::Idle;
+        }
+    }
+
+    pub fn record_processed_blocks(&mut self, peer_id: &PeerId, count: u64) {
+        if let Some(peer_info) = self.peers.get_mut(peer_id) {
+            peer_info.processed_blocks += count;
         }
     }
 
@@ -269,6 +283,25 @@ impl PeerManager {
         }
     }
 
+    pub fn status_of(&self, peer_id: &PeerId) -> Option<Status> {
+        self.peers
+            .get(peer_id)
+            .and_then(|info| info.peer.status.clone())
+    }
+
+    pub fn exact_finalized_epoch_peers(&self, epoch: u64) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|(_, info)| {
+                info.peer
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.finalized_epoch == epoch)
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect()
+    }
+
     pub fn peers_satisfying(&self, qualification: TargetQualification) -> Vec<PeerId> {
         self.peers
             .iter()
@@ -328,6 +361,8 @@ mod tests {
             PeerInfo {
                 peer,
                 peer_status: PeerStatus::Idle,
+                processed_blocks: 0,
+                sync_requests_started: 0,
             },
         );
     }
@@ -541,6 +576,8 @@ mod tests {
             PeerInfo {
                 peer,
                 peer_status: PeerStatus::Downloading,
+                processed_blocks: 0,
+                sync_requests_started: 0,
             },
         );
 
@@ -554,6 +591,70 @@ mod tests {
                 .peer_status,
             PeerStatus::Idle
         ));
+    }
+
+    #[test]
+    fn reserving_a_peer_credits_a_started_sync_request_every_time_including_after_reuse() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let peer = test_peer(Status::default());
+        let peer_id = peer.peer_id;
+        insert_idle(&mut peer_manager, peer);
+
+        peer_manager
+            .fetch_idle_peer_from(&[peer_id])
+            .expect("peer is idle");
+        assert_eq!(
+            peer_manager
+                .peers
+                .get(&peer_id)
+                .expect("peer exists")
+                .sync_requests_started,
+            1
+        );
+
+        assert!(peer_manager.fetch_idle_peer_from(&[peer_id]).is_none());
+        assert_eq!(
+            peer_manager
+                .peers
+                .get(&peer_id)
+                .expect("peer exists")
+                .sync_requests_started,
+            1
+        );
+
+        peer_manager.mark_peer_as_idle(&peer_id);
+        peer_manager
+            .fetch_idle_peer_from_excluding(&[peer_id], &HashSet::new())
+            .expect("peer is idle again");
+        assert_eq!(
+            peer_manager
+                .peers
+                .get(&peer_id)
+                .expect("peer exists")
+                .sync_requests_started,
+            2
+        );
+    }
+
+    #[test]
+    fn record_processed_blocks_accumulates_and_ignores_unknown_peers() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let peer = test_peer(Status::default());
+        let peer_id = peer.peer_id;
+        insert_idle(&mut peer_manager, peer);
+
+        peer_manager.record_processed_blocks(&peer_id, 3);
+        peer_manager.record_processed_blocks(&peer_id, 2);
+        assert_eq!(
+            peer_manager
+                .peers
+                .get(&peer_id)
+                .expect("peer exists")
+                .processed_blocks,
+            5
+        );
+
+        peer_manager.record_processed_blocks(&PeerId::random(), 1);
     }
 
     #[test]

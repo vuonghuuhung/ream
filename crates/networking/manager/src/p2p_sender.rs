@@ -90,4 +90,23 @@ impl P2PSender {
             warn!("Failed to send error response: {err}");
         }
     }
+
+    pub fn send_invalid_request(
+        &self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        stream_id: u64,
+        error: &str,
+    ) {
+        if let Err(err) = self.0.send(P2PMessage::Response(P2PResponse {
+            peer_id,
+            connection_id,
+            stream_id,
+            message: Box::new(RespMessage::Error(ReqRespError::InvalidData(
+                error.to_string(),
+            ))),
+        })) {
+            warn!("Failed to send invalid-request response: {err}");
+        }
+    }
 }

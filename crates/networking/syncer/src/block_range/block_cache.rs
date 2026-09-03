@@ -20,9 +20,66 @@ use ream_polynomial_commitments::handlers::{
 use ssz::Encode;
 use tree_hash::TreeHash;
 
-use super::{MAX_BLOCKS_PER_REQUEST, peer_range_downloader::Range};
+use super::{FrontierObservation, MAX_BLOCKS_PER_REQUEST, peer_range_downloader::Range};
 
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub struct CoverageAnchor {
+    pub frontier: FrontierObservation,
+    pub original_parent_root: B256,
+    pub original_parent_slot: u64,
+    pub covered_through_slot: u64,
+    pub confirming_peers: HashSet<PeerId>,
+}
+
+#[derive(Debug)]
+pub enum AddBlocksError {
+    InvalidBatch(anyhow::Error),
+    CoverageDivergence {
+        expected_parent: B256,
+        actual_parent: B256,
+        anchor: Box<CoverageAnchor>,
+    },
+}
+
+impl std::fmt::Display for AddBlocksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddBlocksError::InvalidBatch(err) => write!(f, "invalid batch: {err:?}"),
+            AddBlocksError::CoverageDivergence {
+                expected_parent,
+                actual_parent,
+                ..
+            } => write!(
+                f,
+                "coverage divergence: expected parent {expected_parent}, got {actual_parent}"
+            ),
+        }
+    }
+}
+
+impl From<anyhow::Error> for AddBlocksError {
+    fn from(err: anyhow::Error) -> Self {
+        AddBlocksError::InvalidBatch(err)
+    }
+}
+
+pub(super) fn validate_range_chain(blocks: &[SignedBeaconBlock]) -> anyhow::Result<()> {
+    for (index, block) in blocks.iter().enumerate().rev() {
+        if index > 0 {
+            ensure!(
+                block.message.parent_root == blocks[index - 1].message.tree_hash_root(),
+                "Block at index {index} has a parent root that does not match the previous block's tree hash root",
+            );
+            ensure!(
+                block.message.slot > blocks[index - 1].message.slot,
+                "Block at index {index} does not have a strictly increasing slot",
+            );
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RequestKey {
@@ -43,14 +100,16 @@ pub struct BlockAndBlobBundle {
     pub block: SignedBeaconBlock,
     pub blobs: HashMap<BlobIdentifier, BlobSidecar>,
     pub columns: HashMap<ColumnIdentifier, DataColumnSidecar>,
+    pub source_peer: PeerId,
 }
 
 impl BlockAndBlobBundle {
-    pub fn new(block: SignedBeaconBlock) -> Self {
+    pub fn new(block: SignedBeaconBlock, source_peer: PeerId) -> Self {
         Self {
             block,
             blobs: HashMap::new(),
             columns: HashMap::new(),
+            source_peer,
         }
     }
 }
@@ -69,6 +128,7 @@ pub struct BlockCache {
     column_ranges_in_progress: HashSet<Range>,
     data_column_identifiers_in_progress: HashSet<ColumnIdentifier>,
     attempts: HashMap<RequestKey, AttemptState>,
+    coverage_anchor: Option<CoverageAnchor>,
 }
 
 impl BlockCache {
@@ -87,7 +147,108 @@ impl BlockCache {
             column_ranges_in_progress: HashSet::new(),
             data_column_identifiers_in_progress: HashSet::new(),
             attempts: HashMap::new(),
+            coverage_anchor: None,
         }
+    }
+
+    pub fn from_recovery_seed(seed: super::recovery::RecoverySeed) -> anyhow::Result<Self> {
+        let super::recovery::RecoverySeed {
+            ancestor_root,
+            ancestor_slot,
+            forward_blocks,
+            target_slot,
+            source_peer,
+        } = seed;
+
+        ensure!(
+            !forward_blocks.is_empty(),
+            "a recovery seed must contain at least one new block"
+        );
+        validate_range_chain(&forward_blocks)?;
+
+        let first = &forward_blocks[0];
+        ensure!(
+            first.message.parent_root == ancestor_root,
+            "recovery seed's first block does not connect to the ancestor root"
+        );
+        ensure!(
+            first.message.slot > ancestor_slot,
+            "recovery seed's first block is not after the ancestor slot"
+        );
+
+        let mut seen_roots = HashSet::new();
+        for block in &forward_blocks {
+            ensure!(
+                block.message.slot <= target_slot,
+                "recovery seed block at slot {} exceeds target_slot {target_slot}",
+                block.message.slot
+            );
+            ensure!(
+                seen_roots.insert(block.message.tree_hash_root()),
+                "duplicate root in recovery seed"
+            );
+        }
+
+        let tip_slot = forward_blocks
+            .last()
+            .expect("checked non-empty above")
+            .message
+            .slot;
+
+        let mut cache = BlockCache::new(ancestor_root, ancestor_slot);
+        cache
+            .add_blocks(forward_blocks, true, source_peer)
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        cache.next_start_slot = tip_slot;
+        Ok(cache)
+    }
+
+    fn is_pristine_for_advance(&self) -> bool {
+        self.blocks_and_blobs.is_empty()
+            && self.block_ranges_to_retry.is_empty()
+            && self.block_ranges_in_progress.is_empty()
+            && self.block_roots_in_progress.is_empty()
+            && self.blob_identifiers_in_progress.is_empty()
+            && self.column_ranges_to_fetch.is_empty()
+            && self.column_ranges_in_progress.is_empty()
+            && self.data_column_identifiers_in_progress.is_empty()
+    }
+
+    pub fn is_pristine_for_restore(&self) -> bool {
+        self.coverage_anchor.is_none() && self.is_pristine_for_advance()
+    }
+
+    pub fn advance_empty_coverage(
+        &mut self,
+        frontier: FrontierObservation,
+        parent_root: B256,
+        covered_through_slot: u64,
+        confirming_peers: HashSet<PeerId>,
+    ) -> anyhow::Result<()> {
+        match &mut self.coverage_anchor {
+            Some(anchor) => {
+                anchor.covered_through_slot = covered_through_slot;
+                anchor.confirming_peers.extend(confirming_peers);
+            }
+            None => {
+                ensure!(
+                    self.is_pristine_for_advance(),
+                    "advance_empty_coverage requires a pristine cache to start a new generation"
+                );
+                self.coverage_anchor = Some(CoverageAnchor {
+                    frontier,
+                    original_parent_root: self.initial_parent_root,
+                    original_parent_slot: self.initial_slot,
+                    covered_through_slot,
+                    confirming_peers,
+                });
+            }
+        }
+
+        self.initial_parent_root = parent_root;
+        self.next_start_slot = covered_through_slot;
+        self.initial_slot = covered_through_slot;
+        Ok(())
     }
 
     fn refresh_attempt_round(&mut self, key: &RequestKey, now: Instant) {
@@ -147,20 +308,24 @@ impl BlockCache {
         &mut self,
         blocks: Vec<SignedBeaconBlock>,
         is_range: bool,
-    ) -> anyhow::Result<()> {
+        source_peer: PeerId,
+    ) -> Result<(), AddBlocksError> {
         // Ensure that all blocks form a chain
         if is_range {
-            for (index, block) in blocks.iter().enumerate().rev() {
-                if index > 0 {
-                    ensure!(
-                        block.message.parent_root == blocks[index - 1].message.tree_hash_root(),
-                        "Block at index {index} has a parent root that does not match the previous block's tree hash root",
-                    );
-                    ensure!(
-                        block.message.slot > blocks[index - 1].message.slot,
-                        "Block at index {index} does not have a strictly increasing slot",
-                    );
+            validate_range_chain(&blocks)?;
+
+            if self.blocks_and_blobs.is_empty()
+                && let Some(anchor) = &self.coverage_anchor
+                && let Some(first) = blocks.first()
+            {
+                if first.message.parent_root != self.initial_parent_root {
+                    return Err(AddBlocksError::CoverageDivergence {
+                        expected_parent: self.initial_parent_root,
+                        actual_parent: first.message.parent_root,
+                        anchor: Box::new(anchor.clone()),
+                    });
                 }
+                self.coverage_anchor = None;
             }
         }
 
@@ -168,7 +333,7 @@ impl BlockCache {
             self.current_cache_size += block.as_ssz_bytes().len() as u64;
             self.blocks_and_blobs.insert(
                 block.message.tree_hash_root(),
-                BlockAndBlobBundle::new(block),
+                BlockAndBlobBundle::new(block, source_peer),
             );
         }
 
@@ -351,6 +516,10 @@ impl BlockCache {
         self.next_start_slot
     }
 
+    pub fn initial_parent_root(&self) -> B256 {
+        self.initial_parent_root
+    }
+
     pub fn estimated_blocks_to_fetch(&self) -> u64 {
         if self.next_start_slot.saturating_sub(self.initial_slot) > 30 {
             return 0;
@@ -406,7 +575,13 @@ impl BlockCache {
         required_columns: &HashSet<u64>,
         candidate_peers: &[PeerId],
         now: Instant,
+        frontier_tracked: bool,
     ) -> DataToFetch {
+        let single_flight = frontier_tracked || self.coverage_anchor.is_some();
+        if single_flight && !self.block_ranges_in_progress.is_empty() {
+            return DataToFetch::DownloadsInProgress;
+        }
+
         if let Some(range) = self.take_schedulable_retry_range(candidate_peers, now) {
             return DataToFetch::BlockRange(range);
         }
@@ -655,7 +830,7 @@ mod tests {
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
         assert_eq!(
-            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now()),
+            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::Finished
         );
     }
@@ -670,13 +845,13 @@ mod tests {
         cache.mark_block_range_in_progress(range);
 
         assert_eq!(
-            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now()),
+            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::DownloadsInProgress
         );
 
         cache.remove_block_range_in_progress(&range);
         assert_eq!(
-            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now()),
+            cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::Finished
         );
     }
@@ -687,15 +862,15 @@ mod tests {
         let mut cache = BlockCache::new(B256::ZERO, 10);
 
         assert_eq!(
-            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now()),
+            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::BlockRange(Range::new(11, 10))
         );
         assert_eq!(
-            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now()),
+            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::BlockRange(Range::new(21, 5))
         );
         assert_eq!(
-            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now()),
+            cache.data_to_fetch(25, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::Finished
         );
     }
@@ -732,7 +907,11 @@ mod tests {
         let boundary_slot = compute_start_slot_at_epoch(boundary_epoch);
         let mut retained = BlockCache::new(parent_root, boundary_slot);
         retained
-            .add_blocks(vec![block_with_blob(boundary_slot)], false)
+            .add_blocks(
+                vec![block_with_blob(boundary_slot)],
+                false,
+                PeerId::random(),
+            )
             .expect("boundary block should enter cache");
         assert_eq!(
             retained.data_to_fetch(
@@ -740,7 +919,8 @@ mod tests {
                 current_epoch,
                 &HashSet::new(),
                 &[],
-                Instant::now()
+                Instant::now(),
+                false
             ),
             DataToFetch::Finished
         );
@@ -748,7 +928,7 @@ mod tests {
         let expired_slot = compute_start_slot_at_epoch(boundary_epoch - 1);
         let mut expired = BlockCache::new(parent_root, expired_slot);
         expired
-            .add_blocks(vec![block_with_blob(expired_slot)], false)
+            .add_blocks(vec![block_with_blob(expired_slot)], false, PeerId::random())
             .expect("expired block should enter cache");
         assert_eq!(
             expired.data_to_fetch(
@@ -756,7 +936,8 @@ mod tests {
                 current_epoch,
                 &HashSet::new(),
                 &[],
-                Instant::now()
+                Instant::now(),
+                false
             ),
             DataToFetch::Finished
         );
@@ -792,7 +973,7 @@ mod tests {
 
         let mut cache = BlockCache::new(parent_root, boundary_slot);
         cache
-            .add_blocks(vec![block], false)
+            .add_blocks(vec![block], false, PeerId::random())
             .expect("boundary block should enter cache");
 
         let required_columns = HashSet::from([1, 5]);
@@ -802,6 +983,7 @@ mod tests {
             &required_columns,
             &[],
             Instant::now(),
+            false,
         ) {
             DataToFetch::MissingDataColumnIdentifiers(identifiers) => {
                 let mut identifiers = identifiers;
@@ -824,7 +1006,8 @@ mod tests {
                 current_epoch,
                 &HashSet::new(),
                 &[],
-                Instant::now()
+                Instant::now(),
+                false
             ),
             DataToFetch::Finished
         );
@@ -860,7 +1043,7 @@ mod tests {
 
         let mut cache = BlockCache::new(B256::ZERO, 0);
         cache
-            .add_blocks(vec![block], false)
+            .add_blocks(vec![block], false, PeerId::random())
             .expect("block should enter cache");
 
         // Only column 0 was requested; extra columns in the response are ignored, not fatal.
@@ -917,7 +1100,7 @@ mod tests {
 
         let mut cache = BlockCache::new(B256::ZERO, 0);
         cache
-            .add_blocks(vec![block], false)
+            .add_blocks(vec![block], false, PeerId::random())
             .expect("block should enter cache");
 
         let mut tampered = columns[1].clone();
@@ -1040,7 +1223,7 @@ mod tests {
         block.message.parent_root = B256::repeat_byte(2);
         let mut cache = BlockCache::new(parent_root, 1);
         cache
-            .add_blocks(vec![block], false)
+            .add_blocks(vec![block], false, PeerId::random())
             .expect("block should enter cache");
 
         let peer_a = PeerId::random();
@@ -1050,7 +1233,7 @@ mod tests {
         cache.mark_attempted(RequestKey::BlockRoot(missing_root), peer_a, &[peer_a], now);
 
         assert_eq!(
-            cache.data_to_fetch(1, 0, &HashSet::new(), &[peer_a], now),
+            cache.data_to_fetch(1, 0, &HashSet::new(), &[peer_a], now, false),
             DataToFetch::DownloadsInProgress
         );
     }
@@ -1080,14 +1263,14 @@ mod tests {
 
         let mut cache = BlockCache::new(parent_root, 2);
         cache
-            .add_blocks(vec![block1, block2], false)
+            .add_blocks(vec![block1, block2], false, PeerId::random())
             .expect("blocks should enter cache");
 
         let peer_a = PeerId::random();
         let now = Instant::now();
         cache.mark_attempted(RequestKey::BlockRoot(root_a), peer_a, &[peer_a], now);
 
-        match cache.data_to_fetch(2, 0, &HashSet::new(), &[peer_a], now) {
+        match cache.data_to_fetch(2, 0, &HashSet::new(), &[peer_a], now, false) {
             DataToFetch::MissingBlockRoots(roots) => {
                 assert_eq!(roots, vec![root_b]);
             }
@@ -1129,6 +1312,139 @@ mod tests {
         assert!(
             result.is_ok(),
             "a column for a block not yet in the cache must be dropped, not erroring the batch"
+        );
+    }
+
+    fn test_observation(anchor_root: B256, anchor_slot: u64) -> FrontierObservation {
+        FrontierObservation {
+            anchor_root,
+            anchor_slot,
+            phase: super::super::SyncPhase::Finalized,
+            scan_start_slot: anchor_slot,
+            target_slot: anchor_slot + 100,
+        }
+    }
+
+    fn child_block(parent_root: B256, slot: u64) -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: BeaconBlock {
+                slot,
+                parent_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[test]
+    fn advance_empty_coverage_opens_a_coverage_anchor_that_a_connecting_block_clears() {
+        let root = B256::repeat_byte(1);
+        let mut cache = BlockCache::new(root, 10);
+        assert!(cache.coverage_anchor.is_none());
+
+        cache
+            .advance_empty_coverage(test_observation(root, 10), root, 20, HashSet::new())
+            .expect("advancing a pristine cache should succeed");
+        assert!(
+            cache.coverage_anchor.is_some(),
+            "a coverage advance must open an anchor pending confirmation"
+        );
+        assert_eq!(cache.next_start_slot(), 20);
+        assert_eq!(
+            cache.initial_parent_root(),
+            root,
+            "an empty span never changes the anchor root"
+        );
+
+        cache
+            .add_blocks(vec![child_block(root, 21)], true, PeerId::random())
+            .expect("a directly-connecting block must be accepted");
+        assert!(
+            cache.coverage_anchor.is_none(),
+            "a connecting first block after the advance must clear the anchor"
+        );
+    }
+
+    #[test]
+    fn a_non_connecting_block_after_a_coverage_advance_is_reported_as_divergence_not_a_missing_parent()
+     {
+        let root = B256::repeat_byte(1);
+        let mut cache = BlockCache::new(root, 10);
+        cache
+            .advance_empty_coverage(test_observation(root, 10), root, 20, HashSet::new())
+            .expect("advancing a pristine cache should succeed");
+
+        let wrong_parent = B256::repeat_byte(2);
+        let result = cache.add_blocks(vec![child_block(wrong_parent, 21)], true, PeerId::random());
+
+        match result {
+            Err(AddBlocksError::CoverageDivergence {
+                expected_parent,
+                actual_parent,
+                ..
+            }) => {
+                assert_eq!(expected_parent, root);
+                assert_eq!(actual_parent, wrong_parent);
+            }
+            other => panic!("expected CoverageDivergence, got {other:?}"),
+        }
+        assert_eq!(
+            cache.block_count(),
+            0,
+            "a divergent batch must not be committed to the cache"
+        );
+    }
+
+    #[test]
+    fn advance_empty_coverage_extends_within_the_same_generation_without_losing_the_original_anchor()
+     {
+        let root = B256::repeat_byte(1);
+        let mut cache = BlockCache::new(root, 10);
+        cache
+            .advance_empty_coverage(
+                test_observation(root, 10),
+                root,
+                20,
+                HashSet::from([PeerId::random()]),
+            )
+            .expect("first advance should succeed");
+        let second_peer = PeerId::random();
+        cache
+            .advance_empty_coverage(
+                test_observation(root, 10),
+                root,
+                30,
+                HashSet::from([second_peer]),
+            )
+            .expect("a second advance within the same generation should succeed");
+
+        assert_eq!(cache.next_start_slot(), 30);
+        let anchor = cache
+            .coverage_anchor
+            .as_ref()
+            .expect("anchor should still be open");
+        assert_eq!(
+            anchor.original_parent_root, root,
+            "the original pre-generation anchor must survive a second advance"
+        );
+        assert_eq!(anchor.covered_through_slot, 30);
+        assert!(anchor.confirming_peers.contains(&second_peer));
+    }
+
+    #[test]
+    fn single_flight_blocks_a_second_block_range_while_a_frontier_is_tracked() {
+        let mut untracked = BlockCache::new(B256::ZERO, 10);
+        untracked.mark_block_range_in_progress(Range::new(11, 10));
+        assert_ne!(
+            untracked.data_to_fetch(100, 0, &HashSet::new(), &[], Instant::now(), false),
+            DataToFetch::DownloadsInProgress,
+        );
+
+        let mut tracked = BlockCache::new(B256::ZERO, 10);
+        tracked.mark_block_range_in_progress(Range::new(11, 10));
+        assert_eq!(
+            tracked.data_to_fetch(100, 0, &HashSet::new(), &[], Instant::now(), true),
+            DataToFetch::DownloadsInProgress,
         );
     }
 }
