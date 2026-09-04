@@ -1175,7 +1175,7 @@ impl BlockRangeSyncer {
         let import_result = self.import_downloaded(block_cache).await;
         let imported_count = match &import_result {
             Ok(count) => *count,
-            Err(failure) => failure.imported_count,
+            Err(err) => err.imported_count,
         };
 
         info!("All blocks processed successfully.");
@@ -1194,22 +1194,22 @@ impl BlockRangeSyncer {
             self.next_segment_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
         }
 
-        import_result.map(|_| ()).map_err(|failure| failure.error)
+        import_result.map(|_| ()).map_err(|err| err.error)
     }
 
     async fn import_downloaded(&mut self, block_cache: BlockCache) -> Result<u64, ImportFailure> {
         let bundles = block_cache
             .get_blocks_and_blobs()
-            .map_err(|error| ImportFailure {
+            .map_err(|err| ImportFailure {
                 imported_count: 0,
-                error,
+                error: err,
             })?;
         let mut imported_count = 0u64;
         for bundle in bundles {
-            if let Err(error) = self.import_one(bundle).await {
+            if let Err(err) = self.import_one(bundle).await {
                 return Err(ImportFailure {
                     imported_count,
-                    error,
+                    error: err,
                 });
             }
             imported_count += 1;
