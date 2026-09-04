@@ -337,6 +337,7 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::anyhow;
+    use ream_p2p::network::beacon::channel::P2PCallbackError;
     use tokio::sync::mpsc::{self, UnboundedReceiver, error::TryRecvError};
 
     use super::*;
@@ -350,7 +351,7 @@ mod tests {
         receiver: &mut UnboundedReceiver<P2PMessage>,
         expected_peer: PeerId,
         expected_root: B256,
-    ) -> mpsc::Sender<anyhow::Result<P2PCallbackResponse>> {
+    ) -> mpsc::Sender<Result<P2PCallbackResponse, P2PCallbackError>> {
         let message = receiver.recv().await.expect("request should be sent");
         let P2PMessage::Request(P2PRequest::BlockRoots {
             peer_id,
@@ -490,7 +491,7 @@ mod tests {
 
         let callback = intercept_request(&mut receiver, peer_id, expected_root).await;
         callback
-            .send(Err(anyhow!("transport failed")))
+            .send(Err(anyhow!("transport failed").into()))
             .await
             .expect("callback error should be delivered");
 

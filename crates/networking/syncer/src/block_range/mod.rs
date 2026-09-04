@@ -1347,15 +1347,15 @@ fn group_by_block_root(identifiers: &[ColumnIdentifier]) -> Vec<DataColumnsByRoo
     }
     by_root
         .into_iter()
-        .filter_map(
-            |(block_root, columns)| match DataColumnsByRootIdentifier::new(block_root, columns) {
+        .filter_map(|(block_root, columns)| {
+            match DataColumnsByRootIdentifier::new(block_root, columns) {
                 Ok(identifier) => Some(identifier),
                 Err(err) => {
                     warn!("Failed to build data column identifier for {block_root}: {err}");
                     None
                 }
-            },
-        )
+            }
+        })
         .collect()
 }
 
