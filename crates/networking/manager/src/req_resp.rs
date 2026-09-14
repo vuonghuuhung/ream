@@ -2,19 +2,13 @@ use std::sync::Arc;
 
 use libp2p::{PeerId, swarm::ConnectionId};
 use ream_consensus_beacon::{blob_sidecar::BlobIdentifier, data_column_sidecar::ColumnIdentifier};
+use ream_network_spec::networks::beacon::beacon_network_spec;
 use ream_p2p::network::beacon::network_state::NetworkState;
-use ream_req_resp::{
-    beacon::messages::{
-        BeaconRequestMessage, BeaconResponseMessage,
-        blob_sidecars::{BlobSidecarsByRangeV1Request, BlobSidecarsByRootV1Request},
-        blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request},
-        data_column_sidecars::{
-            DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request,
-        },
-    },
-    constants::{
-        MAX_REQUEST_BLOCKS, MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN,
-    },
+use ream_req_resp::beacon::messages::{
+    BeaconRequestMessage, BeaconResponseMessage,
+    blob_sidecars::{BlobSidecarsByRangeV1Request, BlobSidecarsByRootV1Request},
+    blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request},
+    data_column_sidecars::{DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request},
 };
 use ream_storage::{
     db::beacon::BeaconDB,
@@ -57,12 +51,13 @@ pub async fn handle_req_resp_message(
             count,
             ..
         }) => {
-            if count > MAX_REQUEST_BLOCKS {
+            let max_request_blocks = beacon_network_spec().max_request_blocks;
+            if count > max_request_blocks {
                 p2p_sender.send_invalid_request(
                     peer_id,
                     connection_id,
                     stream_id,
-                    &format!("Requested count {count} exceeds MAX_REQUEST_BLOCKS"),
+                    &format!("Requested count {count} exceeds maximum {max_request_blocks}"),
                 );
                 return;
             }
@@ -141,12 +136,13 @@ pub async fn handle_req_resp_message(
             start_slot,
             count,
         }) => {
-            if count > MAX_REQUEST_BLOCKS_DENEB {
+            let max_request_blocks = beacon_network_spec().max_request_blocks_deneb;
+            if count > max_request_blocks {
                 p2p_sender.send_invalid_request(
                     peer_id,
                     connection_id,
                     stream_id,
-                    &format!("Requested count {count} exceeds MAX_REQUEST_BLOCKS_DENEB"),
+                    &format!("Requested count {count} exceeds maximum {max_request_blocks}"),
                 );
                 return;
             }
@@ -289,14 +285,13 @@ pub async fn handle_req_resp_message(
             count,
             columns,
         }) => {
-            if count > MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN {
+            let max_request_blocks = beacon_network_spec().max_request_blocks_deneb;
+            if count > max_request_blocks {
                 p2p_sender.send_invalid_request(
                     peer_id,
                     connection_id,
                     stream_id,
-                    &format!(
-                        "Requested count {count} exceeds MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN"
-                    ),
+                    &format!("Requested count {count} exceeds maximum {max_request_blocks}"),
                 );
                 return;
             }

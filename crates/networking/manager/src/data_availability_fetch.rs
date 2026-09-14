@@ -271,6 +271,16 @@ pub async fn fetch_missing_columns(
     };
 
     for sidecar in sidecars {
+        let still_pending = {
+            let store = beacon_chain.store.lock().await;
+            store
+                .data_availability_checker
+                .pending_block(&block_root)
+                .is_some()
+        };
+        if !still_pending {
+            return ColumnFetchOutcome::Complete;
+        }
         if !missing.contains(&sidecar.index) {
             warn!(
                 ?block_root,
@@ -314,7 +324,19 @@ pub async fn fetch_missing_columns(
             .await
         {
             Ok(()) => {}
-            Err(err) => warn!(?block_root, ?err, "Failed to import fetched data column"),
+            Err(err) => {
+                let still_pending = {
+                    let store = beacon_chain.store.lock().await;
+                    store
+                        .data_availability_checker
+                        .pending_block(&block_root)
+                        .is_some()
+                };
+                if !still_pending {
+                    return ColumnFetchOutcome::Complete;
+                }
+                warn!(?block_root, ?err, "Failed to import fetched data column");
+            }
         }
     }
 

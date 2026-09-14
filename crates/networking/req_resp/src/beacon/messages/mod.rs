@@ -27,13 +27,7 @@ use ssz_derive::{Decode, Encode};
 use status::Status;
 
 use super::protocol_id::BeaconSupportedProtocol;
-use crate::{
-    constants::{
-        MAX_BLOBS_PER_BLOCK, MAX_REQUEST_BLOB_SIDECARS, MAX_REQUEST_BLOCKS,
-        MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN,
-    },
-    protocol_id::{ProtocolId, SupportedProtocol},
-};
+use crate::protocol_id::{ProtocolId, SupportedProtocol};
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[ssz(enum_behaviour = "transparent")]
@@ -105,6 +99,7 @@ impl BeaconRequestMessage {
     }
 
     pub fn max_response_chunks(&self) -> u64 {
+        let network_spec = beacon_network_spec();
         match self {
             BeaconRequestMessage::MetaData(_)
             | BeaconRequestMessage::Goodbye(_)
@@ -112,20 +107,29 @@ impl BeaconRequestMessage {
             | BeaconRequestMessage::Ping(_) => 1,
 
             BeaconRequestMessage::BeaconBlocksByRange(request) => {
-                request.count.min(MAX_REQUEST_BLOCKS)
+                request.count.min(network_spec.max_request_blocks)
             }
             BeaconRequestMessage::BeaconBlocksByRoot(request) => request.inner.len() as u64,
-            BeaconRequestMessage::BlobSidecarsByRange(request) => request
-                .count
-                .saturating_mul(MAX_BLOBS_PER_BLOCK)
-                .min(MAX_REQUEST_BLOB_SIDECARS),
+            BeaconRequestMessage::BlobSidecarsByRange(request) => {
+                let max_blobs_per_block = network_spec
+                    .blob_schedule
+                    .iter()
+                    .map(|parameters| parameters.max_blobs_per_block)
+                    .max()
+                    .unwrap_or(network_spec.max_blobs_per_block_electra)
+                    .max(network_spec.max_blobs_per_block_electra);
+                request
+                    .count
+                    .min(network_spec.max_request_blocks_deneb)
+                    .saturating_mul(max_blobs_per_block)
+            }
             BeaconRequestMessage::BlobSidecarsByRoot(request) => request.inner.len() as u64,
             BeaconRequestMessage::DataColumnSidecarsByRange(request) => {
                 let num_columns = request.columns.len() as u64;
                 request
                     .count
+                    .min(network_spec.max_request_blocks_deneb)
                     .saturating_mul(num_columns)
-                    .min(MAX_REQUEST_DATA_COLUMN_SIDECARS_PER_COLUMN.saturating_mul(num_columns))
             }
             BeaconRequestMessage::DataColumnSidecarsByRoot(request) => {
                 request.inner.iter().map(|id| id.columns.len() as u64).sum()
