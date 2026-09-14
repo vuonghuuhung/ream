@@ -1,10 +1,14 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use libp2p::PeerId;
+use ream_consensus_beacon::custody_group::{
+    compute_columns_for_custody_group, get_custody_group_indices,
+};
 use ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
 use ream_p2p::network::beacon::{network_state::NetworkState, peer::CachedPeer};
 use ream_req_resp::beacon::messages::status::Status;
@@ -61,6 +65,7 @@ pub struct PeerInfo {
     pub peer_status: PeerStatus,
     pub processed_blocks: u64,
     pub sync_requests_started: u64,
+    custody_columns: Option<HashSet<u64>>,
 }
 
 pub struct PeerManager {
@@ -71,6 +76,31 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
+    fn custody_columns(peer: &CachedPeer) -> Option<HashSet<u64>> {
+        let enr = peer.enr.as_ref()?;
+        let metadata = peer.meta_data.as_ref()?;
+        let groups = get_custody_group_indices(enr.node_id(), metadata.custody_group_count).ok()?;
+        let mut columns = HashSet::new();
+        for group in groups {
+            columns.extend(compute_columns_for_custody_group(group).ok()?);
+        }
+        Some(columns)
+    }
+
+    fn peer_preference(peer_a: (&PeerId, &PeerInfo), peer_b: (&PeerId, &PeerInfo)) -> Ordering {
+        let (id_a, info_a) = peer_a;
+        let (id_b, info_b) = peer_b;
+        (info_a.sync_requests_started == 0)
+            .cmp(&(info_b.sync_requests_started == 0))
+            .then(info_a.processed_blocks.cmp(&info_b.processed_blocks))
+            .then(
+                info_b
+                    .sync_requests_started
+                    .cmp(&info_a.sync_requests_started),
+            )
+            .then_with(|| id_b.to_bytes().cmp(&id_a.to_bytes()))
+    }
+
     pub fn new(network_state: Arc<NetworkState>) -> Self {
         Self {
             network_state,
@@ -93,9 +123,11 @@ impl PeerManager {
                 continue;
             }
 
+            let custody_columns = Self::custody_columns(peer);
             match self.peers.entry(peer.peer_id) {
                 Entry::Occupied(mut entry) => {
                     entry.get_mut().peer = peer.clone();
+                    entry.get_mut().custody_columns = custody_columns;
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(PeerInfo {
@@ -103,6 +135,7 @@ impl PeerManager {
                         peer_status: PeerStatus::Idle,
                         processed_blocks: 0,
                         sync_requests_started: 0,
+                        custody_columns,
                     });
                 }
             }
@@ -140,18 +173,14 @@ impl PeerManager {
         let idle_peer_id = self
             .peers
             .iter()
-            .find(|(_, peer_info)| matches!(peer_info.peer_status, PeerStatus::Idle))
+            .filter(|(_, peer_info)| matches!(peer_info.peer_status, PeerStatus::Idle))
+            .max_by(|peer_a, peer_b| Self::peer_preference(*peer_a, *peer_b))
             .map(|(peer_id, _)| *peer_id)?;
         self.reserve(&idle_peer_id)
     }
 
     pub fn fetch_idle_peer_from(&mut self, eligible: &[PeerId]) -> Option<CachedPeer> {
-        for peer_id in eligible {
-            if let Some(peer) = self.reserve(peer_id) {
-                return Some(peer);
-            }
-        }
-        None
+        self.fetch_idle_peer_from_excluding(eligible, &HashSet::new())
     }
 
     pub fn fetch_idle_peer_from_excluding(
@@ -159,15 +188,73 @@ impl PeerManager {
         eligible: &[PeerId],
         excluded: &HashSet<PeerId>,
     ) -> Option<CachedPeer> {
-        for peer_id in eligible {
-            if excluded.contains(peer_id) {
-                continue;
-            }
-            if let Some(peer) = self.reserve(peer_id) {
-                return Some(peer);
-            }
-        }
-        None
+        let peer_id = eligible
+            .iter()
+            .filter(|peer_id| !excluded.contains(peer_id))
+            .filter_map(|peer_id| self.peers.get_key_value(peer_id))
+            .filter(|(_, info)| matches!(info.peer_status, PeerStatus::Idle))
+            .max_by(|peer_a, peer_b| Self::peer_preference(*peer_a, *peer_b))
+            .map(|(peer_id, _)| *peer_id)?;
+        self.reserve(&peer_id)
+    }
+
+    pub fn fetch_idle_peer_for_columns_from_excluding(
+        &mut self,
+        eligible: &[PeerId],
+        requested_columns: &[(u64, u64)],
+        excluded: &HashSet<PeerId>,
+    ) -> Option<CachedPeer> {
+        let coverage = |info: &PeerInfo| {
+            requested_columns
+                .iter()
+                .filter(|(column, slot)| {
+                    Self::info_custodies_column(info, *column)
+                        && Self::info_can_serve_slot(info, *slot)
+                })
+                .count()
+        };
+        let peer_id = eligible
+            .iter()
+            .filter(|peer_id| !excluded.contains(peer_id))
+            .filter_map(|peer_id| self.peers.get_key_value(peer_id))
+            .filter(|(_, info)| matches!(info.peer_status, PeerStatus::Idle))
+            .filter(|(_, info)| coverage(info) > 0)
+            .max_by(|peer_a, peer_b| {
+                peer_a
+                    .1
+                    .custody_columns
+                    .is_some()
+                    .cmp(&peer_b.1.custody_columns.is_some())
+                    .then_with(|| coverage(peer_a.1).cmp(&coverage(peer_b.1)))
+                    .then_with(|| Self::peer_preference(*peer_a, *peer_b))
+            })
+            .map(|(peer_id, _)| *peer_id)?;
+        self.reserve(&peer_id)
+    }
+
+    fn info_custodies_column(info: &PeerInfo, column: u64) -> bool {
+        info.custody_columns
+            .as_ref()
+            .is_none_or(|columns| columns.contains(&column))
+    }
+
+    fn info_can_serve_slot(info: &PeerInfo, slot: u64) -> bool {
+        info.peer
+            .status
+            .as_ref()
+            .is_none_or(|status| status.earliest_available_slot <= slot)
+    }
+
+    pub fn peer_custodies_column(&self, peer_id: &PeerId, column: u64) -> bool {
+        self.peers
+            .get(peer_id)
+            .is_none_or(|info| Self::info_custodies_column(info, column))
+    }
+
+    pub fn peer_can_serve_slot(&self, peer_id: &PeerId, slot: u64) -> bool {
+        self.peers
+            .get(peer_id)
+            .is_none_or(|info| Self::info_can_serve_slot(info, slot))
     }
 
     pub fn peer_counts(&self) -> String {
@@ -206,6 +293,13 @@ impl PeerManager {
             let Some(status) = &peer_info.peer.status else {
                 continue;
             };
+            if status
+                .finalized_epoch
+                .checked_mul(SLOTS_PER_EPOCH)
+                .is_none()
+            {
+                continue;
+            }
             if status.finalized_epoch < our_finalized_epoch {
                 continue;
             }
@@ -230,13 +324,15 @@ impl PeerManager {
         eligible.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
 
         TargetSelection::Ready {
-            target_slot: winner_epoch * SLOTS_PER_EPOCH,
+            target_slot: winner_epoch
+                .checked_mul(SLOTS_PER_EPOCH)
+                .expect("overflowing finalized epochs were filtered above"),
             eligible_peers: eligible.into_iter().map(|(id, ..)| id).collect(),
         }
     }
 
     pub fn best_non_finalized(&self, min_peers: usize, our_head_epoch: u64) -> TargetSelection {
-        let our_head_slot = our_head_epoch * SLOTS_PER_EPOCH;
+        let our_head_slot = our_head_epoch.saturating_mul(SLOTS_PER_EPOCH);
         let mut epoch_votes: HashMap<u64, usize> = HashMap::new();
         let mut candidates: Vec<(PeerId, u64, u64)> = Vec::new();
 
@@ -272,7 +368,7 @@ impl PeerManager {
             .filter(|(_, head_slot)| head_slot / SLOTS_PER_EPOCH == target_epoch)
             .map(|(_, head_slot)| *head_slot)
             .max()
-            .unwrap_or(target_epoch * SLOTS_PER_EPOCH);
+            .unwrap_or_else(|| target_epoch.saturating_mul(SLOTS_PER_EPOCH));
 
         let mut eligible = eligible;
         eligible.sort_by_key(|&(_, head_slot)| std::cmp::Reverse(head_slot));
@@ -287,6 +383,12 @@ impl PeerManager {
         self.peers
             .get(peer_id)
             .and_then(|info| info.peer.status.clone())
+    }
+
+    pub fn processed_blocks_of(&self, peer_id: &PeerId) -> u64 {
+        self.peers
+            .get(peer_id)
+            .map_or(0, |info| info.processed_blocks)
     }
 
     pub fn exact_finalized_epoch_peers(&self, epoch: u64) -> Vec<PeerId> {
@@ -363,6 +465,7 @@ mod tests {
                 peer_status: PeerStatus::Idle,
                 processed_blocks: 0,
                 sync_requests_started: 0,
+                custody_columns: None,
             },
         );
     }
@@ -487,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_idle_peer_from_returns_first_idle_in_given_order() {
+    fn fetch_idle_peer_from_prefers_never_used_then_productive_peers() {
         let mut peer_manager = PeerManager::new(test_network_state());
         let first = test_peer(Status::default());
         let second = test_peer(Status::default());
@@ -495,17 +598,40 @@ mod tests {
         let second_id = second.peer_id;
         insert_idle(&mut peer_manager, first);
         insert_idle(&mut peer_manager, second);
+        let first_info = peer_manager.peers.get_mut(&first_id).unwrap();
+        first_info.sync_requests_started = 2;
+        first_info.processed_blocks = 20;
 
         let peer = peer_manager
-            .fetch_idle_peer_from(&[second_id, first_id])
+            .fetch_idle_peer_from(&[first_id, second_id])
             .expect("a peer should be found");
         assert_eq!(peer.peer_id, second_id);
+
+        peer_manager.mark_peer_as_idle(&second_id);
+        let peer = peer_manager
+            .fetch_idle_peer_from(&[first_id, second_id])
+            .expect("a peer should be found");
+        assert_eq!(peer.peer_id, first_id, "productive used peer should win");
 
         assert!(
             peer_manager
                 .fetch_idle_peer_from(&[PeerId::random()])
                 .is_none()
         );
+    }
+
+    #[test]
+    fn best_finalized_ignores_an_epoch_that_cannot_be_converted_to_a_slot() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        insert_idle(
+            &mut peer_manager,
+            test_peer(Status {
+                finalized_epoch: u64::MAX,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(peer_manager.best_finalized(0), TargetSelection::NoQuorum);
     }
 
     #[test]
@@ -522,6 +648,90 @@ mod tests {
                 .fetch_idle_peer_from_excluding(&[peer_id], &excluded)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn data_column_selection_uses_the_peers_advertised_custody() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let wrong_peer = test_peer(Status::default());
+        let right_peer = test_peer(Status::default());
+        let wrong_id = wrong_peer.peer_id;
+        let right_id = right_peer.peer_id;
+        insert_idle(&mut peer_manager, wrong_peer);
+        insert_idle(&mut peer_manager, right_peer);
+        peer_manager
+            .peers
+            .get_mut(&wrong_id)
+            .unwrap()
+            .custody_columns = Some(HashSet::from([1, 2]));
+        peer_manager
+            .peers
+            .get_mut(&right_id)
+            .unwrap()
+            .custody_columns = Some(HashSet::from([7, 8]));
+
+        let selected = peer_manager
+            .fetch_idle_peer_for_columns_from_excluding(
+                &[wrong_id, right_id],
+                &[(7, 0)],
+                &HashSet::new(),
+            )
+            .expect("the peer responsible for column 7 should be selected");
+
+        assert_eq!(selected.peer_id, right_id);
+    }
+
+    #[test]
+    fn data_column_selection_prefers_known_custody_over_unknown_metadata() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let unknown_peer = test_peer(Status::default());
+        let known_peer = test_peer(Status::default());
+        let unknown_id = unknown_peer.peer_id;
+        let known_id = known_peer.peer_id;
+        insert_idle(&mut peer_manager, unknown_peer);
+        insert_idle(&mut peer_manager, known_peer);
+        peer_manager
+            .peers
+            .get_mut(&known_id)
+            .unwrap()
+            .custody_columns = Some(HashSet::from([7]));
+
+        let selected = peer_manager
+            .fetch_idle_peer_for_columns_from_excluding(
+                &[unknown_id, known_id],
+                &[(7, 100), (8, 100)],
+                &HashSet::new(),
+            )
+            .expect("the peer with known coverage should win over unknown metadata");
+
+        assert_eq!(selected.peer_id, known_id);
+    }
+
+    #[test]
+    fn data_column_selection_respects_earliest_available_slot() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let unavailable = test_peer(Status {
+            earliest_available_slot: 101,
+            ..Default::default()
+        });
+        let available = test_peer(Status {
+            earliest_available_slot: 90,
+            ..Default::default()
+        });
+        let unavailable_id = unavailable.peer_id;
+        let available_id = available.peer_id;
+        insert_idle(&mut peer_manager, unavailable);
+        insert_idle(&mut peer_manager, available);
+
+        let selected = peer_manager
+            .fetch_idle_peer_for_columns_from_excluding(
+                &[unavailable_id, available_id],
+                &[(7, 100)],
+                &HashSet::new(),
+            )
+            .expect("a peer retaining slot 100 should be selected");
+
+        assert_eq!(selected.peer_id, available_id);
     }
 
     #[test]
@@ -578,6 +788,7 @@ mod tests {
                 peer_status: PeerStatus::Downloading,
                 processed_blocks: 0,
                 sync_requests_started: 0,
+                custody_columns: None,
             },
         );
 

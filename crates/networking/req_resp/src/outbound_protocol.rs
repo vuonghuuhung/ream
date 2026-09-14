@@ -18,8 +18,6 @@ use ream_consensus_beacon::{
     electra::beacon_block::SignedBeaconBlock,
 };
 use ream_consensus_lean::block::SignedBlock as ActiveBlock;
-use ream_consensus_misc::constants::beacon::{FULU_FORK_EPOCH, genesis_validators_root};
-use ream_network_spec::networks::beacon_network_spec;
 use snap::{read::FrameDecoder, write::FrameEncoder};
 use ssz::{Decode, Encode};
 use ssz_types::{VariableList, typenum::U256};
@@ -156,15 +154,6 @@ impl Decoder for OutboundSSZSnappyCodec {
             src.advance(B32::len_bytes());
         }
 
-        if let Some(context_bytes) = self.context_bytes
-            && context_bytes
-                != beacon_network_spec().fork_digest(FULU_FORK_EPOCH, genesis_validators_root())
-        {
-            return Ok(Some(RespMessage::Error(ReqRespError::InvalidData(
-                "Invalid context bytes, we only support Electra".to_string(),
-            ))));
-        }
-
         let length = match self.length {
             Some(cached_length) => cached_length,
             None => {
@@ -191,7 +180,7 @@ impl Decoder for OutboundSSZSnappyCodec {
             Ok(_) => {
                 src.advance(decoder.get_ref().position() as usize);
                 self.length = None;
-                self.context_bytes = None;
+                let context_bytes = self.context_bytes.take();
                 if ResponseCode::Success == response_code {
                     match self.protocol.protocol {
                         SupportedProtocol::Beacon(beacon_supported_protocol) => {
@@ -257,6 +246,15 @@ impl Decoder for OutboundSSZSnappyCodec {
                                     )
                                 }
                             };
+                            if let Some(context_bytes) = context_bytes
+                                && response_message.context_bytes() != Some(context_bytes)
+                            {
+                                return Ok(Some(RespMessage::Error(ReqRespError::InvalidData(
+                                    format!(
+                                        "Response context bytes {context_bytes} do not match the response object's fork"
+                                    ),
+                                ))));
+                            }
                             Ok(Some(RespMessage::Response(Box::new(
                                 ResponseMessage::Beacon(response_message.into()),
                             ))))

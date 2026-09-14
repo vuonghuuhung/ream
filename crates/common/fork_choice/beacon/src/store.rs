@@ -239,6 +239,11 @@ impl Store {
                 return Ok(head);
             }
 
+            if children.len() == 1 {
+                head = *children[0];
+                continue;
+            }
+
             let mut weighted_children = children
                 .into_iter()
                 .map(|child| Ok((*child, self.get_weight(*child)?)))
@@ -608,26 +613,24 @@ impl Store {
             }
         }
 
-        for index in &non_equivocating_attesting_indices {
-            if self.db.latest_messages_provider().get(*index)?.is_none()
-                || target.epoch
-                    > self
-                        .db
-                        .latest_messages_provider()
-                        .get(*index)?
-                        .ok_or(anyhow!(
-                            "Could not get expected latest message at index: {index}"
-                        ))?
-                        .epoch
+        let latest_messages = self.db.latest_messages_provider();
+        let mut updates = Vec::new();
+        for index in non_equivocating_attesting_indices {
+            if latest_messages
+                .get(index)?
+                .is_none_or(|message| target.epoch > message.epoch)
             {
-                self.db.latest_messages_provider().insert(
-                    *index,
+                updates.push((
+                    index,
                     LatestMessage {
                         epoch: target.epoch,
                         root: beacon_block_root,
                     },
-                )?;
+                ));
             }
+        }
+        if !updates.is_empty() {
+            latest_messages.insert_batch(updates)?;
         }
 
         Ok(())

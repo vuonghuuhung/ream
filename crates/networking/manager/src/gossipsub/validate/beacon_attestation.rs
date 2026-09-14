@@ -5,7 +5,7 @@ use ream_consensus_beacon::{
     electra::beacon_state::BeaconState, single_attestation::SingleAttestation,
 };
 use ream_consensus_misc::{
-    constants::beacon::DOMAIN_BEACON_ATTESTER,
+    constants::beacon::{DOMAIN_BEACON_ATTESTER, SLOTS_PER_EPOCH},
     misc::{compute_epoch_at_slot, compute_signing_root},
 };
 use ream_storage::{
@@ -16,6 +16,12 @@ use ream_validator_beacon::attestation::compute_subnet_for_attestation;
 
 use super::result::ValidationResult;
 
+const GOSSIP_ATTESTATION_SYNC_TOLERANCE: u64 = 2 * SLOTS_PER_EPOCH;
+
+fn is_too_far_behind_to_validate(head_slot: u64, attestation_slot: u64) -> bool {
+    attestation_slot.saturating_sub(head_slot) > GOSSIP_ATTESTATION_SYNC_TOLERANCE
+}
+
 pub async fn validate_beacon_attestation(
     attestation: &SingleAttestation,
     beacon_chain: &BeaconChain,
@@ -25,12 +31,6 @@ pub async fn validate_beacon_attestation(
     let store = beacon_chain.store.lock().await;
 
     let head_root = store.get_head()?;
-    let mut state: BeaconState = store
-        .db
-        .state_provider()
-        .get(head_root)?
-        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
-
     let current_slot = store.get_current_slot()?;
 
     // [IGNORE] attestation.data.slot is equal to or earlier than the current_slot (with a
@@ -40,6 +40,25 @@ pub async fn validate_beacon_attestation(
             "Attestation is from a future slot".to_string(),
         ));
     }
+
+    let head_slot = store
+        .db
+        .block_provider()
+        .get(head_root)?
+        .ok_or_else(|| anyhow!("No beacon block found for head root: {head_root}"))?
+        .message
+        .slot;
+    if is_too_far_behind_to_validate(head_slot, attestation.data.slot) {
+        return Ok(ValidationResult::Ignore(
+            "Local chain is syncing and too far behind to validate attestation".to_string(),
+        ));
+    }
+
+    let mut state: BeaconState = store
+        .db
+        .state_provider()
+        .get(head_root)?
+        .ok_or_else(|| anyhow!("No beacon state found for head root: {head_root}"))?;
 
     if state.slot < attestation.data.slot {
         state.process_slots(attestation.data.slot)?;
@@ -185,4 +204,24 @@ pub async fn validate_beacon_attestation(
         .await
         .put(attestation_key, ());
     Ok(ValidationResult::Accept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GOSSIP_ATTESTATION_SYNC_TOLERANCE, is_too_far_behind_to_validate};
+
+    #[test]
+    fn skips_attestation_validation_only_beyond_sync_tolerance() {
+        let head_slot = 1_000;
+
+        assert!(!is_too_far_behind_to_validate(
+            head_slot,
+            head_slot + GOSSIP_ATTESTATION_SYNC_TOLERANCE
+        ));
+        assert!(is_too_far_behind_to_validate(
+            head_slot,
+            head_slot + GOSSIP_ATTESTATION_SYNC_TOLERANCE + 1
+        ));
+        assert!(!is_too_far_behind_to_validate(head_slot, head_slot - 1));
+    }
 }

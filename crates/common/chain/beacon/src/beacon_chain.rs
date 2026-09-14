@@ -100,6 +100,10 @@ impl BeaconChain {
         self.block_import_sender.subscribe()
     }
 
+    pub async fn initialize_execution_forkchoice(&self) {
+        self.update_execution_forkchoice(true).await;
+    }
+
     pub async fn process_block(
         &self,
         signed_block: SignedBeaconBlock,

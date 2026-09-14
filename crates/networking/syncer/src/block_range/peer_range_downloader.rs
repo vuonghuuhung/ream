@@ -383,6 +383,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn dial_upgrade_errors_are_transport_failures_not_invalid_peer_data() {
+        assert!(matches!(
+            classify_req_resp_error(ReqRespError::RawError(
+                "Dial upgrade error: Timeout".to_string()
+            )),
+            DownloadFailure::Transport(_)
+        ));
+    }
+
     #[tokio::test]
     async fn drain_responses_classifies_remote_error_separately_from_invalid_data() {
         let (tx, rx) = mpsc::channel(10);

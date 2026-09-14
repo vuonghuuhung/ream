@@ -11,6 +11,40 @@ use tree_hash_derive::TreeHash;
 
 use crate::electra::execution_payload::ExecutionPayload;
 
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalV1 {
+    #[serde(with = "serde_utils::u64_hex_be")]
+    pub index: u64,
+    #[serde(with = "serde_utils::u64_hex_be")]
+    pub validator_index: u64,
+    pub address: Address,
+    #[serde(with = "serde_utils::u64_hex_be")]
+    pub amount: u64,
+}
+
+impl From<Withdrawal> for WithdrawalV1 {
+    fn from(value: Withdrawal) -> Self {
+        Self {
+            index: value.index,
+            validator_index: value.validator_index,
+            address: value.address,
+            amount: value.amount,
+        }
+    }
+}
+
+impl From<WithdrawalV1> for Withdrawal {
+    fn from(value: WithdrawalV1) -> Self {
+        Self {
+            index: value.index,
+            validator_index: value.validator_index,
+            address: value.address,
+            amount: value.amount,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionPayloadV3 {
@@ -37,7 +71,7 @@ pub struct ExecutionPayloadV3 {
     pub block_hash: B256,
     #[serde(with = "list_of_hex_var_list")]
     pub transactions: VariableList<VariableList<u8, U1073741824>, U1048576>,
-    pub withdrawals: VariableList<Withdrawal, U16>,
+    pub withdrawals: VariableList<WithdrawalV1, U16>,
     #[serde(with = "serde_utils::u64_hex_be")]
     pub blob_gas_used: u64,
     #[serde(with = "serde_utils::u64_hex_be")]
@@ -61,9 +95,45 @@ impl From<ExecutionPayload> for ExecutionPayloadV3 {
             base_fee_per_gas: value.base_fee_per_gas,
             block_hash: value.block_hash,
             transactions: value.transactions,
-            withdrawals: value.withdrawals,
+            withdrawals: VariableList::new(
+                value
+                    .withdrawals
+                    .into_iter()
+                    .map(WithdrawalV1::from)
+                    .collect(),
+            )
+            .expect("converting a U16-bounded withdrawal list preserves its length"),
             blob_gas_used: value.blob_gas_used,
             excess_blob_gas: value.excess_blob_gas,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::address;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn withdrawal_uses_engine_api_hex_quantities() {
+        let withdrawal = WithdrawalV1 {
+            index: 15,
+            validator_index: 16,
+            address: address!("0000000000000000000000000000000000000001"),
+            amount: 17,
+        };
+
+        let encoded = serde_json::to_value(withdrawal).expect("withdrawal should serialize");
+        assert_eq!(encoded["index"], json!("0xf"));
+        assert_eq!(encoded["validatorIndex"], json!("0x10"));
+        assert_eq!(encoded["amount"], json!("0x11"));
+
+        let decoded: WithdrawalV1 =
+            serde_json::from_value(encoded).expect("Engine API withdrawal should deserialize");
+        assert_eq!(decoded.index, 15);
+        assert_eq!(decoded.validator_index, 16);
+        assert_eq!(decoded.amount, 17);
     }
 }

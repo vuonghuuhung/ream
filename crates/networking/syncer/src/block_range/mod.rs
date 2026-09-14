@@ -32,20 +32,27 @@ use ream_consensus_beacon::{
     electra::beacon_block::SignedBeaconBlock,
     matrix_entry::{compute_cells_and_kzg_proofs, das_context},
 };
-use ream_consensus_misc::{constants::beacon::SLOTS_PER_EPOCH, misc::compute_epoch_at_slot};
+use ream_consensus_misc::{
+    constants::beacon::SLOTS_PER_EPOCH,
+    misc::{compute_epoch_at_slot, compute_start_slot_at_epoch},
+};
 use ream_executor::ReamExecutor;
+use ream_fork_choice_beacon::store::Store;
 use ream_network_spec::networks::beacon_network_spec;
 use ream_p2p::network::beacon::{channel::P2PMessage, network_state::NetworkState};
 use ream_polynomial_commitments::handlers::verify_blob_kzg_proof_batch;
 use ream_req_resp::{
     MAX_CONCURRENT_REQUESTS, beacon::messages::data_column_sidecars::DataColumnsByRootIdentifier,
-    inbound_protocol::ResponseCode,
+    constants::MAX_REQUEST_BLOCKS_DENEB, inbound_protocol::ResponseCode,
 };
 use ream_storage::tables::{
     field::REDBField,
     table::{CustomTable, REDBTable},
 };
-use recovery::{CoverageAdvance, RECOVERY_ROUND_TIMEOUT, RecoveryOutcome};
+use recovery::{
+    CoverageAdvance, MAX_TOTAL_ANCESTOR_REQUESTS_PER_ROUND, RECOVERY_ROUND_TIMEOUT,
+    RecoveryOutcome, is_processable_connection_point,
+};
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 use tree_hash::TreeHash;
@@ -72,6 +79,47 @@ fn should_abort_for_candidate_exhaustion(elapsed: Duration, tasks_in_flight: boo
 
 fn candidate_exhaustion_deserves_backoff(target_slot: u64, head_slot: u64) -> bool {
     target_slot > head_slot
+}
+
+fn parent_lookup_budget_exhausted(
+    started_at: Option<Instant>,
+    requests_started: u64,
+    now: Instant,
+) -> bool {
+    requests_started >= MAX_TOTAL_ANCESTOR_REQUESTS_PER_ROUND
+        || started_at
+            .is_some_and(|started| now.saturating_duration_since(started) >= RECOVERY_ROUND_TIMEOUT)
+}
+
+fn stored_block_slot(store: &Store, root: B256) -> anyhow::Result<Option<u64>> {
+    Ok(store
+        .db
+        .block_provider()
+        .get(root)?
+        .map(|block| block.message.slot))
+}
+
+fn sync_targets_confirm_caught_up(
+    latest_synced_slot: u64,
+    current_slot: u64,
+    finalized_selection: &TargetSelection,
+    head_selection: &TargetSelection,
+) -> bool {
+    if matches!(
+        finalized_selection,
+        TargetSelection::Ready { target_slot, .. } if latest_synced_slot < *target_slot
+    ) {
+        return false;
+    }
+
+    let clock_confirms_caught_up =
+        current_slot.saturating_sub(latest_synced_slot) <= SLOT_IMPORT_TOLERANCE;
+    match head_selection {
+        TargetSelection::Ready { target_slot, .. } => {
+            *target_slot <= latest_synced_slot && clock_confirms_caught_up
+        }
+        TargetSelection::NoQuorum => clock_confirms_caught_up,
+    }
 }
 
 /// Validates downloaded blob sidecars and derives the columns needed for data availability.
@@ -239,6 +287,10 @@ impl StuckFrontier {
             3..=5 => 2,
             _ => 3,
         }
+    }
+
+    fn needs_recovery(&self, observation: &FrontierObservation, next_start_slot: u64) -> bool {
+        self.matches(observation) && self.tier() >= 2 && next_start_slot < observation.target_slot
     }
 
     fn refresh_attempt_round(&mut self, now: Instant) {
@@ -574,12 +626,13 @@ impl BlockRangeSyncer {
         self.peer_manager.update_peer_set();
 
         let store = self.beacon_chain.store.lock().await;
-        let latest_synced_slot = store
-            .db
-            .slot_index_provider()
-            .get_highest_slot()
-            .unwrap_or_default()
-            .unwrap_or(0);
+        let Ok(canonical_head_root) = store.get_head() else {
+            return false;
+        };
+        let latest_synced_slot = match stored_block_slot(&store, canonical_head_root) {
+            Ok(Some(slot)) => slot,
+            _ => return false,
+        };
         let Ok(finalized_epoch) = store.db.finalized_checkpoint_provider().get() else {
             return false;
         };
@@ -590,29 +643,16 @@ impl BlockRangeSyncer {
         drop(store);
 
         let finalized_selection = self.peer_manager.best_finalized(finalized_epoch);
-        let still_behind_finalized = matches!(
-            &finalized_selection,
-            TargetSelection::Ready { target_slot, .. } if latest_synced_slot < *target_slot
-        );
-        if still_behind_finalized {
-            return false;
-        }
-
         let our_head_epoch = latest_synced_slot / SLOTS_PER_EPOCH;
         let head_selection = self
             .peer_manager
             .best_non_finalized(MIN_SYNC_PEERS, our_head_epoch);
-        // The clock is ground truth peers can't fake.
-        let clock_confirms_caught_up =
-            current_slot.saturating_sub(latest_synced_slot) <= SLOT_IMPORT_TOLERANCE;
-
-        let TargetSelection::Ready { target_slot, .. } = head_selection else {
-            return clock_confirms_caught_up;
-        };
-
-        let peers_report_caught_up = target_slot <= latest_synced_slot;
-
-        peers_report_caught_up && clock_confirms_caught_up
+        sync_targets_confirm_caught_up(
+            latest_synced_slot,
+            current_slot,
+            &finalized_selection,
+            &head_selection,
+        )
     }
 
     pub fn start(mut self) -> JoinHandle<anyhow::Result<(BlockRangeSyncer, anyhow::Result<()>)>> {
@@ -669,6 +709,9 @@ impl BlockRangeSyncer {
         let mut recovery_decision_made_this_segment = false;
         let mut pending_conclusions = PendingConclusions::default();
         let mut segment_exclusions = SegmentExclusions::default();
+        let mut parent_lookup_started_at: Option<Instant> = None;
+        let mut parent_lookup_requests = 0u64;
+        let mut parent_lookup_peers = HashSet::new();
 
         loop {
             self.peer_manager.update_peer_set();
@@ -854,12 +897,12 @@ impl BlockRangeSyncer {
                     let parent_root = block_cache.initial_parent_root();
                     let covered_through_slot = coverage.end_slot_exclusive.saturating_sub(1);
                     let confirming_peers = coverage.confirming_peers.clone();
-                    let _ = block_cache.advance_empty_coverage(
+                    block_cache.advance_empty_coverage(
                         frontier_observation,
                         parent_root,
                         covered_through_slot,
                         confirming_peers,
-                    );
+                    )?;
                     restore_window_open = false;
                 }
             }
@@ -871,8 +914,7 @@ impl BlockRangeSyncer {
             if recovery_window_open
                 && !recovery_decision_made_this_segment
                 && let Some(frontier) = self.frontier_for(phase)
-                && frontier.matches(&observation)
-                && frontier.tier() >= 2
+                && frontier.needs_recovery(&observation, block_cache.next_start_slot())
             {
                 recovery_decision_made_this_segment = true;
                 recovery_window_open = false;
@@ -978,9 +1020,23 @@ impl BlockRangeSyncer {
                 DataToFetch::DataColumnRange(range) => {
                     let key = RequestKey::ColumnRange(range);
                     let excluded = block_cache.attempted_peers_for(key);
+                    let expected_identifiers =
+                        block_cache.expected_column_identifiers_in_range(range, &required_columns);
+                    let requested_columns_and_slots: Vec<(u64, u64)> = expected_identifiers
+                        .iter()
+                        .filter_map(|identifier| {
+                            block_cache
+                                .block_slot(identifier.block_root)
+                                .map(|slot| (identifier.index, slot))
+                        })
+                        .collect();
                     let Some(peer) = self
                         .peer_manager
-                        .fetch_idle_peer_from_excluding(&candidate_peers, &excluded)
+                        .fetch_idle_peer_for_columns_from_excluding(
+                            &candidate_peers,
+                            &requested_columns_and_slots,
+                            &excluded,
+                        )
                     else {
                         self.peer_manager.update_peer_set();
                         info!("No idle peers available for data column range sync.");
@@ -989,8 +1045,28 @@ impl BlockRangeSyncer {
                         continue;
                     };
 
-                    let expected_known_identifiers =
-                        block_cache.expected_column_identifiers_in_range(range, &required_columns);
+                    let peer_columns: HashSet<u64> = expected_identifiers
+                        .iter()
+                        .filter_map(|identifier| {
+                            let slot = block_cache.block_slot(identifier.block_root)?;
+                            (self
+                                .peer_manager
+                                .peer_custodies_column(&peer.peer_id, identifier.index)
+                                && self.peer_manager.peer_can_serve_slot(&peer.peer_id, slot))
+                            .then_some(identifier.index)
+                        })
+                        .collect();
+                    let expected_known_identifiers: Vec<ColumnIdentifier> = expected_identifiers
+                        .into_iter()
+                        .filter(|identifier| {
+                            peer_columns.contains(&identifier.index)
+                                && block_cache.block_slot(identifier.block_root).is_some_and(
+                                    |slot| {
+                                        self.peer_manager.peer_can_serve_slot(&peer.peer_id, slot)
+                                    },
+                                )
+                        })
+                        .collect();
 
                     block_cache.mark_column_range_in_progress(range);
                     task_handles.push(DownloadTask::new_data_column_range(
@@ -999,7 +1075,7 @@ impl BlockRangeSyncer {
                             self.p2p_sender.clone(),
                             self.executor.clone(),
                             range,
-                            required_columns.iter().copied().collect(),
+                            peer_columns.into_iter().collect(),
                         ),
                         range,
                         peer.peer_id,
@@ -1007,6 +1083,60 @@ impl BlockRangeSyncer {
                     ));
                 }
                 DataToFetch::MissingBlockRoots(mut block_roots) => {
+                    let mut reached_finalized_boundary = false;
+                    {
+                        let store = self.beacon_chain.store.lock().await;
+                        let finalized_slot = compute_start_slot_at_epoch(
+                            store.db.finalized_checkpoint_provider().get()?.epoch,
+                        );
+                        let mut unresolved = Vec::with_capacity(block_roots.len());
+                        for parent_root in block_roots {
+                            let child_slot =
+                                block_cache.first_child_slot(parent_root).ok_or_else(|| {
+                                    anyhow!("Missing cached child for parent root {parent_root}")
+                                })?;
+                            if is_processable_connection_point(&store, parent_root, child_slot)? {
+                                block_cache.mark_parent_root_known(parent_root);
+                            } else if child_slot <= finalized_slot {
+                                reached_finalized_boundary = true;
+                            } else {
+                                unresolved.push(parent_root);
+                            }
+                        }
+                        block_roots = unresolved;
+                    }
+
+                    if reached_finalized_boundary {
+                        pending_conclusions.observe(
+                            phase,
+                            observation.clone(),
+                            RemoteNoProgressReason::AncestorNotFound,
+                            parent_lookup_peers.clone(),
+                            HashSet::new(),
+                        );
+                        block_cache = BlockCache::new(head_root, head_slot);
+                        break;
+                    }
+                    if block_roots.is_empty() {
+                        continue;
+                    }
+
+                    if parent_lookup_budget_exhausted(
+                        parent_lookup_started_at,
+                        parent_lookup_requests,
+                        now,
+                    ) {
+                        pending_conclusions.observe(
+                            phase,
+                            observation.clone(),
+                            RemoteNoProgressReason::RecoveryBudgetExhausted,
+                            parent_lookup_peers.clone(),
+                            HashSet::new(),
+                        );
+                        block_cache = BlockCache::new(head_root, head_slot);
+                        break;
+                    }
+
                     let mut exhausted_this_tick = HashSet::new();
                     while !block_roots.is_empty() {
                         let Some(peer) = self
@@ -1031,10 +1161,22 @@ impl BlockRangeSyncer {
                             exhausted_this_tick.insert(peer.peer_id);
                             continue;
                         }
-                        let chunk: Vec<B256> =
-                            assigned.into_iter().take(MAX_CONCURRENT_REQUESTS).collect();
+                        let remaining_budget = (MAX_TOTAL_ANCESTOR_REQUESTS_PER_ROUND
+                            - parent_lookup_requests)
+                            as usize;
+                        let chunk: Vec<B256> = assigned
+                            .into_iter()
+                            .take(MAX_CONCURRENT_REQUESTS.min(remaining_budget))
+                            .collect();
+                        if chunk.is_empty() {
+                            self.peer_manager.mark_peer_as_idle(&peer.peer_id);
+                            break;
+                        }
 
                         block_cache.extend_block_roots_in_progress(&chunk);
+                        parent_lookup_started_at.get_or_insert_with(Instant::now);
+                        parent_lookup_requests += chunk.len() as u64;
+                        parent_lookup_peers.insert(peer.peer_id);
 
                         task_handles.push(DownloadTask::new_block_roots(
                             PeerRootsDownloader::start(
@@ -1096,9 +1238,21 @@ impl BlockRangeSyncer {
                 DataToFetch::MissingDataColumnIdentifiers(mut identifiers) => {
                     let mut exhausted_this_tick = HashSet::new();
                     while !identifiers.is_empty() {
+                        let requested_columns_and_slots: Vec<(u64, u64)> = identifiers
+                            .iter()
+                            .filter_map(|identifier| {
+                                block_cache
+                                    .block_slot(identifier.block_root)
+                                    .map(|slot| (identifier.index, slot))
+                            })
+                            .collect();
                         let Some(peer) = self
                             .peer_manager
-                            .fetch_idle_peer_from_excluding(&candidate_peers, &exhausted_this_tick)
+                            .fetch_idle_peer_for_columns_from_excluding(
+                                &candidate_peers,
+                                &requested_columns_and_slots,
+                                &exhausted_this_tick,
+                            )
                         else {
                             self.peer_manager.update_peer_set();
                             info!("No idle peers available for data column sync.");
@@ -1108,9 +1262,17 @@ impl BlockRangeSyncer {
 
                         let (assigned, remaining): (Vec<ColumnIdentifier>, Vec<ColumnIdentifier>) =
                             identifiers.into_iter().partition(|identifier| {
-                                !block_cache
-                                    .attempted_peers_for(RequestKey::Column(*identifier))
-                                    .contains(&peer.peer_id)
+                                self.peer_manager
+                                    .peer_custodies_column(&peer.peer_id, identifier.index)
+                                    && block_cache.block_slot(identifier.block_root).is_some_and(
+                                        |slot| {
+                                            self.peer_manager
+                                                .peer_can_serve_slot(&peer.peer_id, slot)
+                                        },
+                                    )
+                                    && !block_cache
+                                        .attempted_peers_for(RequestKey::Column(*identifier))
+                                        .contains(&peer.peer_id)
                             });
                         identifiers = remaining;
                         if assigned.is_empty() {
@@ -1118,8 +1280,10 @@ impl BlockRangeSyncer {
                             exhausted_this_tick.insert(peer.peer_id);
                             continue;
                         }
-                        let chunk: Vec<ColumnIdentifier> =
-                            assigned.into_iter().take(MAX_CONCURRENT_REQUESTS).collect();
+                        let chunk: Vec<ColumnIdentifier> = assigned
+                            .into_iter()
+                            .take(MAX_REQUEST_BLOCKS_DENEB as usize)
+                            .collect();
 
                         block_cache.extend_data_column_identifiers_in_progress(&chunk);
 
@@ -1178,7 +1342,13 @@ impl BlockRangeSyncer {
             Err(err) => err.imported_count,
         };
 
-        info!("All blocks processed successfully.");
+        match &import_result {
+            Ok(_) => info!("All blocks processed successfully."),
+            Err(err) => warn!(
+                "Block processing stopped after {} successful imports: {:?}",
+                err.imported_count, err.error
+            ),
+        }
 
         if imported_count > 0 {
             self.clear_tracker();
@@ -1866,8 +2036,22 @@ fn poll_ready_tasks(
                             continue;
                         }
 
-                        if let Err(err) = block_cache.add_blocks(blocks, false, *peer_id) {
+                        if let Err(err) = block_cache.add_parent_blocks(blocks, *peer_id) {
                             warn!("Failed to add downloaded blocks to cache: {err:?}");
+                            for root in roots.iter() {
+                                block_cache.mark_attempted(
+                                    RequestKey::BlockRoot(*root),
+                                    *peer_id,
+                                    candidate_peers,
+                                    now,
+                                );
+                            }
+                            peer_manager.ban_peer(
+                                peer_id,
+                                BanReason::ProtocolError(format!(
+                                    "returned an invalid parent block: {err}"
+                                )),
+                            );
                         }
                     }
                     Poll::Pending => {}
@@ -2156,6 +2340,18 @@ mod tests {
     }
 
     #[test]
+    fn parent_lookup_is_bounded_by_both_requests_and_time() {
+        let now = Instant::now();
+        assert!(!parent_lookup_budget_exhausted(Some(now), 127, now));
+        assert!(parent_lookup_budget_exhausted(Some(now), 128, now));
+        assert!(parent_lookup_budget_exhausted(
+            Some(now - RECOVERY_ROUND_TIMEOUT),
+            1,
+            now
+        ));
+    }
+
+    #[test]
     fn range_blob_sidecars_build_valid_columns_and_reject_bad_proofs() {
         let blob = Blob::default();
         let blob_bytes = blob.to_fixed_bytes();
@@ -2338,7 +2534,20 @@ mod tests {
         let (_data_dir, beacon_chain) = test_beacon_chain();
         let seconds_per_slot = beacon_network_spec().seconds_per_slot();
         let highest_slot = 100u64;
-        let highest_root = B256::repeat_byte(0x42);
+        let genesis_block = SignedBeaconBlock {
+            message: BeaconBlock::default(),
+            signature: Default::default(),
+        };
+        let genesis_root = genesis_block.message.tree_hash_root();
+        let highest_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: highest_slot,
+                parent_root: genesis_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let highest_root = highest_block.message.tree_hash_root();
 
         {
             let store = beacon_chain.store.lock().await;
@@ -2349,15 +2558,50 @@ mod tests {
                 .expect("insert genesis time");
             store
                 .db
-                .slot_index_provider()
-                .insert(highest_slot, highest_root)
-                .expect("insert highest synced slot");
+                .block_provider()
+                .insert(genesis_root, genesis_block)
+                .expect("insert genesis block");
+            store
+                .db
+                .block_provider()
+                .insert(highest_root, highest_block)
+                .expect("insert canonical head block");
+            store
+                .db
+                .unrealized_justifications_provider()
+                .insert(
+                    genesis_root,
+                    Checkpoint {
+                        epoch: 0,
+                        root: genesis_root,
+                    },
+                )
+                .expect("insert genesis voting source");
+            store
+                .db
+                .unrealized_justifications_provider()
+                .insert(
+                    highest_root,
+                    Checkpoint {
+                        epoch: 0,
+                        root: highest_root,
+                    },
+                )
+                .expect("insert canonical head voting source");
+            store
+                .db
+                .justified_checkpoint_provider()
+                .insert(Checkpoint {
+                    epoch: 0,
+                    root: highest_root,
+                })
+                .expect("insert justified checkpoint");
             store
                 .db
                 .finalized_checkpoint_provider()
                 .insert(Checkpoint {
                     epoch: 0,
-                    root: B256::ZERO,
+                    root: genesis_root,
                 })
                 .expect("insert finalized checkpoint");
         }
@@ -2397,7 +2641,7 @@ mod tests {
             .await
             .db
             .time_provider()
-            .insert(highest_slot * seconds_per_slot)
+            .insert((highest_slot + SLOTS_PER_EPOCH) * seconds_per_slot)
             .expect("insert time");
         assert!(syncer.is_synced_to_head_slot().await);
 
@@ -2412,6 +2656,138 @@ mod tests {
             .insert((highest_slot + 10_000) * seconds_per_slot)
             .expect("insert time");
         assert!(!syncer.is_synced_to_head_slot().await);
+    }
+
+    #[test]
+    fn is_synced_to_head_slot_ignores_a_higher_noncanonical_stored_block() {
+        futures::executor::block_on(
+            is_synced_to_head_slot_ignores_a_higher_noncanonical_stored_block_inner(),
+        );
+    }
+
+    async fn is_synced_to_head_slot_ignores_a_higher_noncanonical_stored_block_inner() {
+        initialize_test_network_spec();
+        let (_data_dir, beacon_chain) = test_beacon_chain();
+        let seconds_per_slot = beacon_network_spec().seconds_per_slot();
+        let canonical_slot = 100u64;
+        let side_slot = canonical_slot + SLOT_IMPORT_TOLERANCE + 10;
+        let genesis_block = SignedBeaconBlock {
+            message: BeaconBlock::default(),
+            signature: Default::default(),
+        };
+        let genesis_root = genesis_block.message.tree_hash_root();
+        let canonical_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: canonical_slot,
+                parent_root: genesis_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let canonical_root = canonical_block.message.tree_hash_root();
+        let side_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: side_slot,
+                parent_root: B256::repeat_byte(0x55),
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let side_root = side_block.message.tree_hash_root();
+
+        {
+            let store = beacon_chain.store.lock().await;
+            store.db.genesis_time_provider().insert(0).unwrap();
+            store
+                .db
+                .block_provider()
+                .insert(genesis_root, genesis_block)
+                .unwrap();
+            store
+                .db
+                .block_provider()
+                .insert(canonical_root, canonical_block)
+                .unwrap();
+            store
+                .db
+                .unrealized_justifications_provider()
+                .insert(
+                    genesis_root,
+                    Checkpoint {
+                        epoch: 0,
+                        root: genesis_root,
+                    },
+                )
+                .unwrap();
+            store
+                .db
+                .unrealized_justifications_provider()
+                .insert(
+                    canonical_root,
+                    Checkpoint {
+                        epoch: 0,
+                        root: canonical_root,
+                    },
+                )
+                .unwrap();
+            store
+                .db
+                .block_provider()
+                .insert(side_root, side_block)
+                .unwrap();
+            store
+                .db
+                .justified_checkpoint_provider()
+                .insert(Checkpoint {
+                    epoch: 0,
+                    root: canonical_root,
+                })
+                .unwrap();
+            store
+                .db
+                .finalized_checkpoint_provider()
+                .insert(Checkpoint {
+                    epoch: 0,
+                    root: genesis_root,
+                })
+                .unwrap();
+            store
+                .db
+                .time_provider()
+                .insert(side_slot * seconds_per_slot)
+                .unwrap();
+            assert_eq!(store.get_head().unwrap(), canonical_root);
+        }
+
+        let network_state = test_network_state();
+        for _ in 0..MIN_SYNC_PEERS {
+            let peer_id = PeerId::random();
+            let mut peer = CachedPeer::new(
+                peer_id,
+                None,
+                ConnectionState::Connected,
+                Direction::Outbound,
+                None,
+            );
+            peer.status = Some(Status {
+                head_slot: side_slot,
+                head_root: side_root,
+                ..Default::default()
+            });
+            network_state.peer_table.write().insert(peer_id, peer);
+        }
+
+        let (p2p_sender, _p2p_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut syncer = BlockRangeSyncer::new(
+            Arc::new(beacon_chain),
+            p2p_sender,
+            network_state,
+            ReamExecutor::new().expect("executor should start"),
+        );
+        assert!(
+            !syncer.is_synced_to_head_slot().await,
+            "a higher side-fork block in the slot index must not stand in for the canonical head"
+        );
     }
 
     #[test]
@@ -2431,6 +2807,20 @@ mod tests {
         let omitted_root = B256::repeat_byte(9);
 
         let mut block_cache = BlockCache::new(B256::ZERO, 0);
+        block_cache
+            .add_blocks(
+                vec![SignedBeaconBlock {
+                    message: BeaconBlock {
+                        slot: 2,
+                        parent_root: delivered_root,
+                        ..Default::default()
+                    },
+                    signature: Default::default(),
+                }],
+                true,
+                peer_id,
+            )
+            .expect("cached child should be accepted");
         let handle = executor.spawn(async move { StreamOutcome::Complete(vec![delivered_block]) });
         let mut tasks = vec![DownloadTask::new_block_roots(
             handle,
@@ -2854,6 +3244,25 @@ mod tests {
             },
             generation,
         }
+    }
+
+    #[test]
+    fn coverage_at_target_does_not_consume_the_segments_recovery_decision() {
+        let frontier = test_frontier(test_frontier_id(0), B256::ZERO, 10);
+        let observation = FrontierObservation {
+            anchor_root: B256::ZERO,
+            anchor_slot: 10,
+            phase: SyncPhase::Finalized,
+            scan_start_slot: 0,
+            target_slot: 110,
+        };
+
+        assert!(frontier.needs_recovery(&observation, 109));
+        assert!(
+            !frontier.needs_recovery(&observation, 110),
+            "a restored Finalized frontier that already covers its target must leave the shared \
+             recovery window available for a later Head frontier"
+        );
     }
 
     #[test]

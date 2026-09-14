@@ -9,8 +9,12 @@ use libp2p::PeerId;
 use ream_chain_beacon::beacon_chain::is_data_availability_check_required;
 use ream_consensus_beacon::{
     blob_sidecar::{BlobIdentifier, BlobSidecar},
-    data_column_sidecar::{ColumnIdentifier, DataColumnSidecar},
+    data_column_sidecar::{
+        ColumnIdentifier, DataColumnSidecar, NUMBER_OF_COLUMNS,
+        get_data_column_sidecars_from_column_sidecar,
+    },
     electra::beacon_block::SignedBeaconBlock,
+    matrix_entry::{das_context, recover_cells_and_kzg_proofs},
 };
 use ream_consensus_misc::misc::compute_epoch_at_slot;
 use ream_network_spec::networks::beacon_network_spec;
@@ -18,6 +22,7 @@ use ream_polynomial_commitments::handlers::{
     verify_blob_kzg_proof_batch, verify_data_column_sidecar_kzg_proofs,
 };
 use ssz::Encode;
+use tracing::warn;
 use tree_hash::TreeHash;
 
 use super::{FrontierObservation, MAX_BLOCKS_PER_REQUEST, peer_range_downloader::Range};
@@ -116,6 +121,7 @@ impl BlockAndBlobBundle {
 
 pub struct BlockCache {
     blocks_and_blobs: HashMap<B256, BlockAndBlobBundle>,
+    known_parent_roots: HashSet<B256>,
     current_cache_size: u64,
     initial_parent_root: B256,
     block_ranges_to_retry: Vec<Range>,
@@ -135,6 +141,7 @@ impl BlockCache {
     pub fn new(initial_parent_root: B256, next_start_slot: u64) -> Self {
         Self {
             blocks_and_blobs: HashMap::new(),
+            known_parent_roots: HashSet::new(),
             current_cache_size: 0,
             initial_parent_root,
             block_ranges_to_retry: vec![],
@@ -340,6 +347,51 @@ impl BlockCache {
         Ok(())
     }
 
+    pub fn add_parent_blocks(
+        &mut self,
+        blocks: Vec<SignedBeaconBlock>,
+        source_peer: PeerId,
+    ) -> Result<(), AddBlocksError> {
+        for block in &blocks {
+            let root = block.message.tree_hash_root();
+            let mut matching_children = self
+                .blocks_and_blobs
+                .values()
+                .filter(|child| child.block.message.parent_root == root)
+                .peekable();
+            if matching_children.peek().is_none() {
+                return Err(anyhow::anyhow!(
+                    "parent block {root} does not connect to any cached child"
+                )
+                .into());
+            }
+            for child in matching_children {
+                if block.message.slot >= child.block.message.slot {
+                    return Err(anyhow::anyhow!(
+                        "parent block {root} at slot {} is not older than child at slot {}",
+                        block.message.slot,
+                        child.block.message.slot
+                    )
+                    .into());
+                }
+            }
+        }
+
+        self.add_blocks(blocks, false, source_peer)
+    }
+
+    pub fn first_child_slot(&self, parent_root: B256) -> Option<u64> {
+        self.blocks_and_blobs
+            .values()
+            .filter(|bundle| bundle.block.message.parent_root == parent_root)
+            .map(|bundle| bundle.block.message.slot)
+            .min()
+    }
+
+    pub fn mark_parent_root_known(&mut self, parent_root: B256) {
+        self.known_parent_roots.insert(parent_root);
+    }
+
     pub fn add_blobs(&mut self, blobs: Vec<BlobSidecar>) -> anyhow::Result<()> {
         let mut validated = Vec::with_capacity(blobs.len());
         for blob_sidecar in blobs {
@@ -421,6 +473,11 @@ impl BlockCache {
                 .get(&block_root)
                 .expect("presence just checked above");
             ensure!(
+                column.verify(),
+                "Malformed data column sidecar {} for block {block_root}",
+                column.index
+            );
+            ensure!(
                 column.signed_block_header == bundle.block.signed_header(),
                 "Data column sidecar {} does not belong to block {block_root}",
                 column.index
@@ -439,6 +496,7 @@ impl BlockCache {
             validated.push((block_root, column));
         }
 
+        let affected_roots: HashSet<B256> = validated.iter().map(|(root, _)| *root).collect();
         for (block_root, column) in validated {
             let bundle = self
                 .blocks_and_blobs
@@ -447,6 +505,16 @@ impl BlockCache {
             bundle
                 .columns
                 .insert(ColumnIdentifier::new(block_root, column.index), column);
+        }
+
+        for block_root in affected_roots {
+            let bundle = self
+                .blocks_and_blobs
+                .get_mut(&block_root)
+                .expect("affected block remains cached");
+            if let Err(err) = reconstruct_required_columns(bundle, required_columns) {
+                warn!("Failed to reconstruct data columns for block {block_root}: {err:?}");
+            }
         }
 
         Ok(())
@@ -595,6 +663,10 @@ impl BlockCache {
             return DataToFetch::BlockRange(Range::new(start_slot, blocks_to_fill));
         }
 
+        if !self.block_ranges_in_progress.is_empty() {
+            return DataToFetch::DownloadsInProgress;
+        }
+
         if let Some(range) = self.take_schedulable_column_range(candidate_peers, now) {
             return DataToFetch::DataColumnRange(range);
         }
@@ -674,6 +746,9 @@ impl BlockCache {
                 .blocks_and_blobs
                 .contains_key(&block.block.message.parent_root)
                 && block.block.message.parent_root != self.initial_parent_root
+                && !self
+                    .known_parent_roots
+                    .contains(&block.block.message.parent_root)
             {
                 missing_roots.push(block.block.message.parent_root);
             }
@@ -777,6 +852,65 @@ impl BlockCache {
         }
         expected
     }
+
+    pub fn block_slot(&self, block_root: B256) -> Option<u64> {
+        self.blocks_and_blobs
+            .get(&block_root)
+            .map(|bundle| bundle.block.message.slot)
+    }
+}
+
+fn reconstruct_required_columns(
+    bundle: &mut BlockAndBlobBundle,
+    required_columns: &HashSet<u64>,
+) -> anyhow::Result<()> {
+    if required_columns.iter().all(|index| {
+        bundle.columns.contains_key(&ColumnIdentifier::new(
+            bundle.block.message.tree_hash_root(),
+            *index,
+        ))
+    }) || bundle.columns.len() < (NUMBER_OF_COLUMNS / 2) as usize
+    {
+        return Ok(());
+    }
+
+    let available: Vec<&DataColumnSidecar> = bundle.columns.values().collect();
+    let base = *available
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no data column is available for reconstruction"))?;
+    let blob_count = base.column.len();
+    let mut cells_and_kzg_proofs = Vec::with_capacity(blob_count);
+
+    for blob_index in 0..blob_count {
+        let mut column_indices = Vec::with_capacity(available.len());
+        let mut cells = Vec::with_capacity(available.len());
+        for sidecar in &available {
+            let cell = sidecar.column.get(blob_index).ok_or_else(|| {
+                anyhow::anyhow!("column {} is missing blob row {blob_index}", sidecar.index)
+            })?;
+            column_indices.push(sidecar.index);
+            cells.push(cell.clone());
+        }
+        cells_and_kzg_proofs.push(recover_cells_and_kzg_proofs(
+            column_indices,
+            cells,
+            das_context(),
+        )?);
+    }
+
+    let reconstructed =
+        get_data_column_sidecars_from_column_sidecar(base.clone(), cells_and_kzg_proofs)
+            .map_err(|err| anyhow::anyhow!("failed to assemble reconstructed columns: {err}"))?;
+    let block_root = bundle.block.message.tree_hash_root();
+    for column in reconstructed {
+        if required_columns.contains(&column.index) {
+            bundle
+                .columns
+                .entry(ColumnIdentifier::new(block_root, column.index))
+                .or_insert(column);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,6 +987,33 @@ mod tests {
         assert_eq!(
             cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now(), false),
             DataToFetch::Finished
+        );
+    }
+
+    #[test]
+    fn in_flight_range_prevents_a_temporary_gap_from_becoming_a_parent_lookup() {
+        initialize_test_network_spec();
+        let mut cache = BlockCache::new(B256::ZERO, 10);
+        let range = match cache.data_to_fetch(20, 0, &HashSet::new(), &[], Instant::now(), false) {
+            DataToFetch::BlockRange(range) => range,
+            other => panic!("expected initial block range, got {other:?}"),
+        };
+        cache.mark_block_range_in_progress(range);
+        let later_block = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 20,
+                parent_root: B256::repeat_byte(9),
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        cache
+            .add_blocks(vec![later_block], false, PeerId::random())
+            .expect("later range result should enter cache");
+
+        assert_eq!(
+            cache.data_to_fetch(20, 0, &HashSet::new(), &[], Instant::now(), false),
+            DataToFetch::DownloadsInProgress
         );
     }
 
@@ -1015,6 +1176,7 @@ mod tests {
 
     #[test]
     fn add_data_columns_ignores_extras_and_rejects_bad_proofs() {
+        initialize_test_network_spec();
         use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
 
         let blob = Blob::default();
@@ -1043,7 +1205,7 @@ mod tests {
 
         let mut cache = BlockCache::new(B256::ZERO, 0);
         cache
-            .add_blocks(vec![block], false, PeerId::random())
+            .add_blocks(vec![block.clone()], false, PeerId::random())
             .expect("block should enter cache");
 
         // Only column 0 was requested; extra columns in the response are ignored, not fatal.
@@ -1068,10 +1230,32 @@ mod tests {
                 .add_data_columns(vec![tampered], &required_columns)
                 .is_err()
         );
+
+        let mut reconstruction_cache = BlockCache::new(B256::ZERO, 0);
+        reconstruction_cache
+            .add_blocks(vec![block], false, PeerId::random())
+            .expect("block should enter reconstruction cache");
+        let all_columns: HashSet<u64> = (0..NUMBER_OF_COLUMNS).collect();
+        reconstruction_cache
+            .add_data_columns(
+                columns[..(NUMBER_OF_COLUMNS / 2) as usize].to_vec(),
+                &all_columns,
+            )
+            .expect("the first half of valid columns should reconstruct the second half");
+        assert_eq!(
+            reconstruction_cache
+                .blocks_and_blobs
+                .get(&block_root)
+                .expect("block should be cached")
+                .columns
+                .len(),
+            NUMBER_OF_COLUMNS as usize
+        );
     }
 
     #[test]
     fn add_data_columns_is_atomic_a_bad_item_does_not_leave_earlier_items_mutated() {
+        initialize_test_network_spec();
         use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
 
         let blob = Blob::default();
@@ -1280,6 +1464,7 @@ mod tests {
 
     #[test]
     fn add_data_columns_drops_a_column_for_an_unknown_block_without_erroring_or_banning() {
+        initialize_test_network_spec();
         use ream_consensus_beacon::data_column_sidecar::get_data_column_sidecars_from_block;
 
         let blob = Blob::default();
@@ -1334,6 +1519,44 @@ mod tests {
             },
             signature: Default::default(),
         }
+    }
+
+    #[test]
+    fn known_processable_parent_stops_missing_parent_requests() {
+        initialize_test_network_spec();
+        let initial_root = B256::repeat_byte(1);
+        let known_parent = B256::repeat_byte(2);
+        let peer = PeerId::random();
+        let mut cache = BlockCache::new(initial_root, 10);
+        cache
+            .add_blocks(vec![child_block(known_parent, 20)], true, peer)
+            .unwrap();
+
+        assert_eq!(cache.first_child_slot(known_parent), Some(20));
+        assert_eq!(cache.get_missing_block_roots(), vec![known_parent]);
+        cache.mark_parent_root_known(known_parent);
+        assert!(cache.get_missing_block_roots().is_empty());
+    }
+
+    #[test]
+    fn parent_lookup_rejects_a_non_decreasing_ancestry() {
+        initialize_test_network_spec();
+        let initial_root = B256::repeat_byte(1);
+        let peer = PeerId::random();
+        let mut parent = child_block(B256::repeat_byte(3), 20);
+        let parent_root = parent.message.tree_hash_root();
+        let child = child_block(parent_root, 20);
+        let mut cache = BlockCache::new(initial_root, 10);
+        cache.add_blocks(vec![child], true, peer).unwrap();
+
+        assert!(cache.add_parent_blocks(vec![parent.clone()], peer).is_err());
+        parent.message.slot = 19;
+        let valid_parent_root = parent.message.tree_hash_root();
+        let mut cache = BlockCache::new(initial_root, 10);
+        cache
+            .add_blocks(vec![child_block(valid_parent_root, 20)], true, peer)
+            .unwrap();
+        cache.add_parent_blocks(vec![parent], peer).unwrap();
     }
 
     #[test]

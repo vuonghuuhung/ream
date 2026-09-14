@@ -435,6 +435,13 @@ pub fn is_valid_versioned_hashes(new_payload_request: &NewPayloadRequest) -> any
     )
 }
 
+fn payload_status_allows_import(status: PayloadStatus) -> bool {
+    matches!(
+        status,
+        PayloadStatus::Valid | PayloadStatus::Syncing | PayloadStatus::Accepted
+    )
+}
+
 fn get_execution_requests_list(execution_requests: &ExecutionRequests) -> Vec<Bytes> {
     let mut requests_list = vec![];
     if !execution_requests.deposits.is_empty() {
@@ -495,7 +502,9 @@ impl ExecutionApi for ExecutionEngine {
             return Ok(false);
         }
 
-        return Ok(self.notify_new_payload(new_payload_request).await? == PayloadStatus::Valid);
+        let status = self.notify_new_payload(new_payload_request).await?;
+
+        Ok(payload_status_allows_import(status))
     }
 
     async fn engine_get_blobs_v1(
@@ -580,5 +589,21 @@ impl ExecutionApi for ExecutionEngine {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syncing_and_accepted_payloads_are_not_treated_as_invalid() {
+        assert!(payload_status_allows_import(PayloadStatus::Valid));
+        assert!(payload_status_allows_import(PayloadStatus::Syncing));
+        assert!(payload_status_allows_import(PayloadStatus::Accepted));
+        assert!(!payload_status_allows_import(PayloadStatus::Invalid));
+        assert!(!payload_status_allows_import(
+            PayloadStatus::InvalidBlockHash
+        ));
     }
 }

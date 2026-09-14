@@ -8,6 +8,7 @@ pub mod status;
 
 use std::sync::Arc;
 
+use alloy_primitives::aliases::B32;
 use blob_sidecars::{BlobSidecarsByRangeV1Request, BlobSidecarsByRootV1Request};
 use blocks::{BeaconBlocksByRangeV2Request, BeaconBlocksByRootV2Request};
 use data_column_sidecars::{DataColumnSidecarsByRangeV1Request, DataColumnSidecarsByRootV1Request};
@@ -18,6 +19,10 @@ use ream_consensus_beacon::{
     blob_sidecar::BlobSidecar, data_column_sidecar::DataColumnSidecar,
     electra::beacon_block::SignedBeaconBlock,
 };
+use ream_consensus_misc::{
+    constants::beacon::genesis_validators_root, misc::compute_epoch_at_slot,
+};
+use ream_network_spec::networks::beacon_network_spec;
 use ssz_derive::{Decode, Encode};
 use status::Status;
 
@@ -142,4 +147,26 @@ pub enum BeaconResponseMessage {
     BlobSidecarsByRoot(BlobSidecar),
     DataColumnSidecarsByRange(DataColumnSidecar),
     DataColumnSidecarsByRoot(DataColumnSidecar),
+}
+
+impl BeaconResponseMessage {
+    pub fn context_bytes(&self) -> Option<B32> {
+        let slot = match self {
+            Self::BeaconBlocksByRange(block) | Self::BeaconBlocksByRoot(block) => {
+                block.message.slot
+            }
+            Self::BlobSidecarsByRange(sidecar) | Self::BlobSidecarsByRoot(sidecar) => {
+                sidecar.signed_block_header.message.slot
+            }
+            Self::DataColumnSidecarsByRange(sidecar) | Self::DataColumnSidecarsByRoot(sidecar) => {
+                sidecar.signed_block_header.message.slot
+            }
+            Self::MetaData(_) | Self::Goodbye(_) | Self::Status(_) | Self::Ping(_) => return None,
+        };
+
+        Some(
+            beacon_network_spec()
+                .fork_digest(compute_epoch_at_slot(slot), genesis_validators_root()),
+        )
+    }
 }

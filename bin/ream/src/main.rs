@@ -635,6 +635,8 @@ async fn run_beacon_node_inner(
     };
     let beacon_chain = Arc::new(beacon_chain);
 
+    beacon_chain.initialize_execution_forkchoice().await;
+
     // Create network manager
     let mut manager_config = ManagerConfig::from(config);
     manager_config.gossipsub_history_length = gossipsub_history_length;

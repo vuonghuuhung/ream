@@ -91,7 +91,7 @@ fn budget_exhausted(implicated_peers: HashSet<PeerId>) -> anyhow::Result<Recover
     )
 }
 
-fn is_processable_connection_point(
+pub(super) fn is_processable_connection_point(
     store: &Store,
     parent_root: B256,
     first_child_slot: u64,
@@ -488,7 +488,19 @@ impl BlockRangeSyncer {
         }
         let mut groups: Vec<(B256, Vec<PeerId>)> = by_root.into_iter().collect();
         groups.sort_by(|(root_a, group_a), (root_b, group_b)| {
-            group_b.len().cmp(&group_a.len()).then(root_a.cmp(root_b))
+            let score_a: u64 = group_a
+                .iter()
+                .map(|peer_id| self.peer_manager.processed_blocks_of(peer_id))
+                .sum();
+            let score_b: u64 = group_b
+                .iter()
+                .map(|peer_id| self.peer_manager.processed_blocks_of(peer_id))
+                .sum();
+            group_b
+                .len()
+                .cmp(&group_a.len())
+                .then(score_b.cmp(&score_a))
+                .then(root_a.cmp(root_b))
         });
         groups.into_iter().flat_map(|(_, group)| group).collect()
     }

@@ -31,7 +31,7 @@ use libp2p_identity::{Keypair, PublicKey, secp256k1};
 use network_state::NetworkState;
 use parking_lot::{Mutex, RwLock};
 use peer::CachedPeer;
-use ream_consensus_misc::constants::beacon::genesis_validators_root;
+use ream_consensus_misc::constants::beacon::{SLOTS_PER_EPOCH, genesis_validators_root};
 use ream_discv5::discovery::{Discovery, DiscoveryOutEvent, QueryType};
 use ream_executor::ReamExecutor;
 use ream_metrics::set_peer_count;
@@ -68,6 +68,15 @@ use crate::{
     gossipsub::{GossipsubBehaviour, beacon::topics::GossipTopic, snappy::SnappyTransform},
     network::misc::{Executor, build_transport, peer_id_from_enr},
 };
+
+fn status_is_plausible(status: &Status, current_epoch: u64) -> bool {
+    status.earliest_available_slot <= status.head_slot
+        && status.finalized_epoch <= current_epoch.saturating_add(1)
+        && status.head_slot
+            <= current_epoch
+                .saturating_add(2)
+                .saturating_mul(SLOTS_PER_EPOCH)
+}
 
 #[derive(NetworkBehaviour)]
 pub(crate) struct ReamBehaviour {
@@ -454,7 +463,14 @@ impl Network {
                         }
                     }
 
-                    let peer_count = peer_table.len();
+                    let active_peer_count = counts
+                        .get(&ConnectionState::Connected)
+                        .copied()
+                        .unwrap_or_default()
+                        + counts
+                            .get(&ConnectionState::Connecting)
+                            .copied()
+                            .unwrap_or_default();
                     let peers_to_ping_count = self.peers_to_ping.len();
                     let seq_number = self.network_state.meta_data.read().seq_number;
 
@@ -466,8 +482,8 @@ impl Network {
                         warn!("Failed to update attestation subnet subscriptions: {err:?}");
                     }
 
-                    if peer_count < TARGET_PEER_COUNT {
-                        info!("Peer count is below target: {peer_count}, discovering more peers");
+                    if active_peer_count < TARGET_PEER_COUNT {
+                        info!("Active peer count is below target: {active_peer_count}, discovering more peers");
                         self.swarm
                             .behaviour_mut()
                             .discovery
@@ -866,14 +882,19 @@ impl Network {
     fn handle_status_req_resp_event(&mut self, peer_id: PeerId, status: Status) {
         if self.network_state.peer_table.read().get(&peer_id).is_some() {
             // We only want to have peers on the same network as us
-            let fork_digest = beacon_network_spec().fork_digest(
-                beacon_network_spec().current_epoch(),
-                genesis_validators_root(),
-            );
+            let current_epoch = beacon_network_spec().current_epoch();
+            let fork_digest =
+                beacon_network_spec().fork_digest(current_epoch, genesis_validators_root());
             if status.fork_digest != fork_digest {
                 warn!(
                     "Peer {peer_id} is not on the same network as us, removing from peer table, fork_digest: {}, our fork_digest: {fork_digest}",
                     status.fork_digest,
+                );
+                self.network_state.peer_table.write().remove(&peer_id);
+            } else if !status_is_plausible(&status, current_epoch) {
+                warn!(
+                    "Peer {peer_id} sent an impossible Status (finalized_epoch={}, head_slot={}, earliest_available_slot={}), removing from peer table",
+                    status.finalized_epoch, status.head_slot, status.earliest_available_slot
                 );
                 self.network_state.peer_table.write().remove(&peer_id);
             } else {
@@ -956,6 +977,42 @@ mod tests {
         config::NetworkConfig,
         gossipsub::beacon::{configurations::GossipsubConfig, topics::GossipTopicKind},
     };
+
+    #[test]
+    fn status_sanity_rejects_impossible_history_and_future_progress() {
+        let current_epoch = 100;
+        assert!(status_is_plausible(
+            &Status {
+                finalized_epoch: 98,
+                head_slot: 100 * SLOTS_PER_EPOCH,
+                earliest_available_slot: 90 * SLOTS_PER_EPOCH,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                head_slot: 10,
+                earliest_available_slot: 11,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                finalized_epoch: current_epoch + 2,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+        assert!(!status_is_plausible(
+            &Status {
+                head_slot: (current_epoch + 3) * SLOTS_PER_EPOCH,
+                ..Default::default()
+            },
+            current_epoch
+        ));
+    }
 
     async fn create_network(
         socket_address: IpAddr,

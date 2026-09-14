@@ -325,7 +325,8 @@ pub fn payload_v3_to_execution_payload(payload: ExecutionPayloadV3) -> Execution
         base_fee_per_gas: payload.base_fee_per_gas,
         block_hash: payload.block_hash,
         transactions: payload.transactions,
-        withdrawals: payload.withdrawals,
+        withdrawals: VariableList::new(payload.withdrawals.into_iter().map(Into::into).collect())
+            .expect("converting a U16-bounded withdrawal list preserves its length"),
         blob_gas_used: payload.blob_gas_used,
         excess_blob_gas: payload.excess_blob_gas,
     }
@@ -352,7 +353,9 @@ pub fn test_payload_attributes(parent_beacon_block_root: B256) -> PayloadAttribu
 #[cfg(test)]
 mod tests {
     use alloy_primitives::B256;
-    use ream_execution_rpc_types::forkchoice_update::ForkchoiceStateV1;
+    use ream_execution_rpc_types::{
+        execution_payload::WithdrawalV1, forkchoice_update::ForkchoiceStateV1,
+    };
 
     use super::*;
 
@@ -392,7 +395,15 @@ mod tests {
         let expected_timestamp = attrs.timestamp;
         let expected_prev_randao = attrs.prev_randao;
         let expected_fee_recipient = attrs.suggested_fee_recipient;
-        let expected_withdrawals = attrs.withdrawals.clone();
+        let expected_withdrawals = VariableList::new(
+            attrs
+                .withdrawals
+                .clone()
+                .into_iter()
+                .map(WithdrawalV1::from)
+                .collect(),
+        )
+        .expect("converting a U16-bounded withdrawal list preserves its length");
         let mut generator = ExecutionBlockGenerator::new(genesis_hash);
 
         let response = generator

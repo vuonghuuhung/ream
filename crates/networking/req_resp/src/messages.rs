@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy_primitives::aliases::B32;
 use ssz_derive::{Decode, Encode};
 
 use super::{
@@ -36,4 +37,13 @@ impl RequestMessage {
 pub enum ResponseMessage {
     Beacon(Arc<BeaconResponseMessage>),
     Lean(Arc<LeanResponseMessage>),
+}
+
+impl ResponseMessage {
+    pub fn context_bytes(&self) -> Option<B32> {
+        match self {
+            Self::Beacon(message) => message.context_bytes(),
+            Self::Lean(_) => None,
+        }
+    }
 }

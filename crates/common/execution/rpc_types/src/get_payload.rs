@@ -141,7 +141,10 @@ impl Payload {
             base_fee_per_gas: ep.base_fee_per_gas,
             block_hash: ep.block_hash,
             transactions: ep.transactions.clone(),
-            withdrawals: ep.withdrawals.clone(),
+            withdrawals: VariableList::new(
+                ep.withdrawals.iter().cloned().map(Into::into).collect(),
+            )
+            .expect("converting a U16-bounded withdrawal list preserves its length"),
             blob_gas_used: ep.blob_gas_used,
             excess_blob_gas: ep.excess_blob_gas,
         }

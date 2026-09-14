@@ -16,8 +16,6 @@ use libp2p::{
     bytes::{Buf, BufMut},
     core::UpgradeInfo,
 };
-use ream_consensus_misc::constants::beacon::{FULU_FORK_EPOCH, genesis_validators_root};
-use ream_network_spec::networks::beacon_network_spec;
 use snap::{read::FrameDecoder, write::FrameEncoder};
 use ssz::{Decode, Encode};
 use ssz_types::{VariableList, typenum::U256};
@@ -136,6 +134,10 @@ impl Encoder<RespMessage> for InboundSSZSnappyCodec {
     fn encode(&mut self, item: RespMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
         dst.clear();
         let response_code = item.as_response_code().expect("EndOfStream cannot be sent");
+        let context_bytes = match &item {
+            RespMessage::Response(message) => message.context_bytes(),
+            RespMessage::Error(_) | RespMessage::EndOfStream => None,
+        };
         dst.put_u8(u8::from(response_code));
 
         let bytes = match item {
@@ -163,9 +165,12 @@ impl Encoder<RespMessage> for InboundSSZSnappyCodec {
         }
 
         if self.protocol.protocol.has_context_bytes() && response_code == ResponseCode::Success {
-            dst.extend(
-                beacon_network_spec().fork_digest(FULU_FORK_EPOCH, genesis_validators_root()),
-            );
+            let context_bytes = context_bytes.ok_or_else(|| {
+                ReqRespError::InvalidData(
+                    "Chunked beacon response does not provide fork context bytes".to_string(),
+                )
+            })?;
+            dst.extend(context_bytes);
         }
 
         Uvi::<usize>::default().encode(bytes.len(), dst)?;

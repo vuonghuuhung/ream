@@ -1,12 +1,33 @@
 use std::sync::Arc;
 
 use ream_consensus_beacon::fork_choice::latest_message::LatestMessage;
-use redb::{Database, TableDefinition};
+use redb::{Database, Durability, TableDefinition};
 
-use crate::tables::{ssz_encoder::SSZEncoding, table::REDBTable};
+use crate::{
+    errors::StoreError,
+    tables::{ssz_encoder::SSZEncoding, table::REDBTable},
+};
 
 pub struct LatestMessagesTable {
     pub db: Arc<Database>,
+}
+
+impl LatestMessagesTable {
+    pub fn insert_batch(
+        &self,
+        entries: impl IntoIterator<Item = (u64, LatestMessage)>,
+    ) -> Result<(), StoreError> {
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_durability(Durability::Immediate)?;
+        {
+            let mut table = write_txn.open_table(Self::TABLE_DEFINITION)?;
+            for (index, message) in entries {
+                table.insert(index, message)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
 }
 
 /// Table definition for the Latest Message table

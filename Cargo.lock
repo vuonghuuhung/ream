@@ -6614,6 +6614,7 @@ dependencies = [
  "ethereum_ssz_derive",
  "ream-consensus-misc",
  "serde",
+ "serde_json",
  "sha2",
  "ssz_types",
  "tree_hash",
