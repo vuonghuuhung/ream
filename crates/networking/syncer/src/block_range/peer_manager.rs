@@ -385,6 +385,13 @@ impl PeerManager {
             .and_then(|info| info.peer.status.clone())
     }
 
+    pub fn peer_head_reaches(&self, peer_id: &PeerId, slot: u64) -> bool {
+        self.peers
+            .get(peer_id)
+            .and_then(|info| info.peer.status.as_ref())
+            .is_some_and(|status| status.head_slot >= slot)
+    }
+
     pub fn processed_blocks_of(&self, peer_id: &PeerId) -> u64 {
         self.peers
             .get(peer_id)
@@ -882,5 +889,25 @@ mod tests {
             peer_manager.peers_satisfying(TargetQualification::HeadEpoch(20)),
             vec![id]
         );
+    }
+
+    #[test]
+    fn peer_head_reaches_filters_peers_that_cannot_serve_the_refined_target() {
+        let mut peer_manager = PeerManager::new(test_network_state());
+        let lower = test_peer(Status {
+            head_slot: 98,
+            ..Default::default()
+        });
+        let target = test_peer(Status {
+            head_slot: 100,
+            ..Default::default()
+        });
+        let lower_id = lower.peer_id;
+        let target_id = target.peer_id;
+        insert_idle(&mut peer_manager, lower);
+        insert_idle(&mut peer_manager, target);
+
+        assert!(!peer_manager.peer_head_reaches(&lower_id, 100));
+        assert!(peer_manager.peer_head_reaches(&target_id, 100));
     }
 }

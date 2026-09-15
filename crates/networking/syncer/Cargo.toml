@@ -46,6 +46,7 @@ ream-execution-rpc-types.workspace = true
 ream-operation-pool.workspace = true
 ream-peer.workspace = true
 ream-sync-committee-pool.workspace = true
+snap.workspace = true
 tempfile.workspace = true
 
 [lints]

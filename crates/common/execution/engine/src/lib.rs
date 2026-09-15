@@ -436,10 +436,7 @@ pub fn is_valid_versioned_hashes(new_payload_request: &NewPayloadRequest) -> any
 }
 
 fn payload_status_allows_import(status: PayloadStatus) -> bool {
-    matches!(
-        status,
-        PayloadStatus::Valid | PayloadStatus::Syncing | PayloadStatus::Accepted
-    )
+    matches!(status, PayloadStatus::Valid)
 }
 
 fn get_execution_requests_list(execution_requests: &ExecutionRequests) -> Vec<Bytes> {
@@ -597,10 +594,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn syncing_and_accepted_payloads_are_not_treated_as_invalid() {
+    fn only_valid_payload_status_allows_import() {
         assert!(payload_status_allows_import(PayloadStatus::Valid));
-        assert!(payload_status_allows_import(PayloadStatus::Syncing));
-        assert!(payload_status_allows_import(PayloadStatus::Accepted));
+        assert!(!payload_status_allows_import(PayloadStatus::Syncing));
+        assert!(!payload_status_allows_import(PayloadStatus::Accepted));
         assert!(!payload_status_allows_import(PayloadStatus::Invalid));
         assert!(!payload_status_allows_import(
             PayloadStatus::InvalidBlockHash

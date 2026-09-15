@@ -7194,6 +7194,7 @@ dependencies = [
  "ream-req-resp",
  "ream-storage",
  "ream-sync-committee-pool",
+ "snap",
  "tempfile",
  "tokio",
  "tracing",

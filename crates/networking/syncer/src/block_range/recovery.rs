@@ -179,8 +179,13 @@ impl BlockRangeSyncer {
         let mut failed_this_round: HashSet<PeerId> = HashSet::new();
         let mut next_peer_index = 0usize;
 
+        let probe_end_exclusive = match observation.phase {
+            SyncPhase::Finalized => observation.target_slot.saturating_add(1),
+            SyncPhase::Head => observation.target_slot,
+        };
+
         for _ in 0..MAX_PROBE_REQUESTS_PER_ROUND {
-            if !budget.has_capacity() || cursor > observation.target_slot {
+            if !budget.has_capacity() || cursor >= probe_end_exclusive {
                 break;
             }
             let Some((peer_id, advance_by)) = reserve_round_robin(
@@ -192,7 +197,7 @@ impl BlockRangeSyncer {
                 break;
             };
             next_peer_index = (next_peer_index + advance_by) % probe_peers.len();
-            let window = SLOTS_PER_EPOCH.min(observation.target_slot.saturating_add(1) - cursor);
+            let window = SLOTS_PER_EPOCH.min(probe_end_exclusive - cursor);
             let range = Range::new(cursor, window);
             budget.consume();
 
@@ -329,38 +334,71 @@ impl BlockRangeSyncer {
         }
         match observation.phase {
             SyncPhase::Head => {
-                let eligible: Vec<PeerId> = candidate_peers
-                    .iter()
-                    .filter(|peer_id| !excluded.contains(peer_id))
-                    .copied()
-                    .collect();
-                let Some(peer) = self
-                    .peer_manager
-                    .fetch_idle_peer_from_excluding(&eligible, &HashSet::new())
-                else {
-                    return no_progress(RemoteNoProgressReason::AncestorNotFound, implicated_peers);
-                };
-                let peer_id = peer.peer_id;
-                let end_exclusive = observation.target_slot.saturating_add(1);
-                let window = SLOTS_PER_EPOCH.min(end_exclusive);
-                let start = end_exclusive.saturating_sub(window);
-                let range = Range::new(start, window.max(1));
                 let mut implicated = implicated_peers;
-                budget.consume();
-                match self.probe_range(peer_id, range, &mut implicated).await {
-                    ProbeStep::Found(blocks) => {
-                        self.resolve_candidate(
+                let eligible =
+                    self.group_by_head_root_agreement(candidate_peers, observation.target_slot);
+
+                for &peer_id in &eligible {
+                    if !budget.has_capacity() {
+                        break;
+                    }
+                    if excluded.contains(&peer_id) {
+                        continue;
+                    }
+                    let Some(status) = self.peer_manager.status_of(&peer_id) else {
+                        continue;
+                    };
+                    let Some(reserved) = self
+                        .peer_manager
+                        .fetch_idle_peer_from_excluding(&[peer_id], &HashSet::new())
+                    else {
+                        continue;
+                    };
+                    debug_assert_eq!(reserved.peer_id, peer_id);
+
+                    budget.consume();
+                    let Some(block) = self
+                        .fetch_single_root(peer_id, status.head_root, &mut implicated)
+                        .await
+                    else {
+                        continue;
+                    };
+                    if block.message.slot != observation.target_slot {
+                        implicated.insert(peer_id);
+                        continue;
+                    }
+
+                    match self
+                        .resolve_candidate(
                             observation,
-                            blocks,
+                            vec![block],
                             HashSet::from([peer_id]),
                             &eligible,
                             budget,
                             implicated,
                         )
-                        .await
+                        .await?
+                    {
+                        RecoveryOutcome::NoProgress {
+                            reason,
+                            implicated_peers,
+                            ..
+                        } => {
+                            if reason == RemoteNoProgressReason::RecoveryBudgetExhausted {
+                                return no_progress(reason, implicated_peers);
+                            }
+                            implicated = implicated_peers;
+                        }
+                        other => return Ok(other),
                     }
-                    _ => no_progress(RemoteNoProgressReason::AncestorNotFound, implicated),
                 }
+
+                let reason = if budget.has_capacity() {
+                    RemoteNoProgressReason::AncestorNotFound
+                } else {
+                    RemoteNoProgressReason::RecoveryBudgetExhausted
+                };
+                no_progress(reason, implicated)
             }
             SyncPhase::Finalized => {
                 let epoch = observation.target_slot / SLOTS_PER_EPOCH;
@@ -482,6 +520,40 @@ impl BlockRangeSyncer {
                 .entry(status.finalized_root)
                 .or_default()
                 .push(peer_id);
+        }
+        for group in by_root.values_mut() {
+            group.sort();
+        }
+        let mut groups: Vec<(B256, Vec<PeerId>)> = by_root.into_iter().collect();
+        groups.sort_by(|(root_a, group_a), (root_b, group_b)| {
+            let score_a: u64 = group_a
+                .iter()
+                .map(|peer_id| self.peer_manager.processed_blocks_of(peer_id))
+                .sum();
+            let score_b: u64 = group_b
+                .iter()
+                .map(|peer_id| self.peer_manager.processed_blocks_of(peer_id))
+                .sum();
+            group_b
+                .len()
+                .cmp(&group_a.len())
+                .then(score_b.cmp(&score_a))
+                .then(root_a.cmp(root_b))
+        });
+        groups.into_iter().flat_map(|(_, group)| group).collect()
+    }
+
+    fn group_by_head_root_agreement(&self, peers: &[PeerId], target_slot: u64) -> Vec<PeerId> {
+        let mut by_root: std::collections::BTreeMap<B256, Vec<PeerId>> =
+            std::collections::BTreeMap::new();
+        for &peer_id in peers {
+            let Some(status) = self.peer_manager.status_of(&peer_id) else {
+                continue;
+            };
+            if status.head_slot != target_slot {
+                continue;
+            }
+            by_root.entry(status.head_root).or_default().push(peer_id);
         }
         for group in by_root.values_mut() {
             group.sort();

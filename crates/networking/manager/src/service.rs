@@ -542,7 +542,7 @@ impl NetworkManagerService {
                     match result {
                         Ok(Ok((mut block_range_syncer, sync_result))) => {
                             if let Err(err) = sync_result {
-                                warn!("Block range sync segment failed: {err:?}");
+                                warn!("Block range sync failed: {err:?}");
                             }
                             if block_range_syncer.is_synced_to_head_slot().await {
                                 idle_syncer = Some(block_range_syncer);

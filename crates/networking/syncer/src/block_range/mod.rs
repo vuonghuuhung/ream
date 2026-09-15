@@ -81,6 +81,13 @@ fn candidate_exhaustion_deserves_backoff(target_slot: u64, head_slot: u64) -> bo
     target_slot > head_slot
 }
 
+fn finalized_target_reached(selection: &TargetSelection, next_start_slot: u64) -> bool {
+    matches!(
+        selection,
+        TargetSelection::Ready { target_slot, .. } if next_start_slot >= *target_slot
+    )
+}
+
 fn parent_lookup_budget_exhausted(
     started_at: Option<Instant>,
     requests_started: u64,
@@ -462,12 +469,12 @@ impl PendingConclusions {
 }
 
 #[derive(Default)]
-struct SegmentExclusions {
+struct RangeExclusions {
     finalized: HashSet<PeerId>,
     head: HashSet<PeerId>,
 }
 
-impl SegmentExclusions {
+impl RangeExclusions {
     fn for_phase(&self, phase: SyncPhase) -> &HashSet<PeerId> {
         match phase {
             SyncPhase::Finalized => &self.finalized,
@@ -488,7 +495,7 @@ pub struct BlockRangeSyncer {
     pub peer_manager: PeerManager,
     pub p2p_sender: UnboundedSender<P2PMessage>,
     pub executor: ReamExecutor,
-    next_segment_not_before: Option<Instant>,
+    next_range_not_before: Option<Instant>,
     next_generation: u64,
     finalized_frontier: Option<StuckFrontier>,
     head_frontier: Option<StuckFrontier>,
@@ -506,7 +513,7 @@ impl BlockRangeSyncer {
             p2p_sender,
             peer_manager: PeerManager::new(network_state),
             executor,
-            next_segment_not_before: None,
+            next_range_not_before: None,
             next_generation: 0,
             finalized_frontier: None,
             head_frontier: None,
@@ -561,7 +568,7 @@ impl BlockRangeSyncer {
     fn commit_pending_conclusions(
         &mut self,
         pending: PendingConclusions,
-        exclusions: SegmentExclusions,
+        exclusions: RangeExclusions,
     ) {
         for phase in [SyncPhase::Finalized, SyncPhase::Head] {
             if let Some(record) = pending.for_phase(phase).clone() {
@@ -605,7 +612,7 @@ impl BlockRangeSyncer {
     fn clear_tracker(&mut self) {
         self.finalized_frontier = None;
         self.head_frontier = None;
-        self.next_segment_not_before = None;
+        self.next_range_not_before = None;
     }
 
     fn reconcile_not_ahead(&mut self, observation: &FrontierObservation) {
@@ -658,16 +665,16 @@ impl BlockRangeSyncer {
     pub fn start(mut self) -> JoinHandle<anyhow::Result<(BlockRangeSyncer, anyhow::Result<()>)>> {
         let executor = self.executor.clone();
         executor.spawn(async move {
-            let result = self.run_segment().await;
+            let result = self.run_range_sync().await;
             (self, result)
         })
     }
 
-    async fn run_segment(&mut self) -> anyhow::Result<()> {
-        if let Some(not_before) = self.next_segment_not_before.take()
+    async fn run_range_sync(&mut self) -> anyhow::Result<()> {
+        if let Some(not_before) = self.next_range_not_before.take()
             && let Some(remaining) = not_before.checked_duration_since(Instant::now())
         {
-            info!("Backing off {remaining:?} after the previous segment made no progress...");
+            info!("Backing off {remaining:?} after the previous range made no progress...");
             sleep(remaining).await;
         }
 
@@ -706,9 +713,9 @@ impl BlockRangeSyncer {
         let scan_start_slot = head_slot;
         let mut restore_window_open = true;
         let mut recovery_window_open = true;
-        let mut recovery_decision_made_this_segment = false;
+        let mut recovery_decision_made_this_range = false;
         let mut pending_conclusions = PendingConclusions::default();
-        let mut segment_exclusions = SegmentExclusions::default();
+        let mut range_exclusions = RangeExclusions::default();
         let mut parent_lookup_started_at: Option<Instant> = None;
         let mut parent_lookup_requests = 0u64;
         let mut parent_lookup_peers = HashSet::new();
@@ -734,15 +741,12 @@ impl BlockRangeSyncer {
 
             if active_target.is_none() {
                 if phase == SyncPhase::Finalized {
+                    if finalized_target_reached(&selection, block_cache.next_start_slot()) {
+                        phase = SyncPhase::Head;
+                        continue;
+                    }
                     match &selection {
-                        TargetSelection::Ready {
-                            target_slot,
-                            eligible_peers,
-                        } => {
-                            if block_cache.next_start_slot() >= *target_slot {
-                                phase = SyncPhase::Head;
-                                continue;
-                            }
+                        TargetSelection::Ready { eligible_peers, .. } => {
                             if eligible_peers.len() < MIN_SYNC_PEERS {
                                 info!(
                                     "Finalized target not yet confirmed by enough peers ({} < {MIN_SYNC_PEERS}), waiting...",
@@ -753,14 +757,15 @@ impl BlockRangeSyncer {
                             }
                         }
                         TargetSelection::NoQuorum => {
-                            phase = SyncPhase::Head;
+                            info!("No finalized sync target yet, waiting for peers...");
+                            sleep(SLEEP_DURATION).await;
                             continue;
                         }
                     }
                 } else if let TargetSelection::NoQuorum = &selection {
                     if finalized_phase_settled || block_cache.block_count() > 0 {
                         info!(
-                            "No head-phase sync target after the finalized phase settled; ending this segment."
+                            "No head-phase sync target after the finalized phase settled; ending this range."
                         );
                         break;
                     }
@@ -805,7 +810,12 @@ impl BlockRangeSyncer {
             };
             self.reconcile_not_ahead(&observation);
 
-            let candidate_peers = self.peer_manager.peers_satisfying(target.qualification);
+            let candidate_peers: Vec<PeerId> = self
+                .peer_manager
+                .peers_satisfying(target.qualification)
+                .into_iter()
+                .filter(|peer_id| self.peer_manager.peer_head_reaches(peer_id, target.slot))
+                .collect();
 
             let now = Instant::now();
             let poll_outcome = {
@@ -845,7 +855,7 @@ impl BlockRangeSyncer {
                     "the peer that served the non-connecting block must never be excluded \
                      alongside the peers that supplied the false coverage claim"
                 );
-                segment_exclusions
+                range_exclusions
                     .for_phase_mut(divergence_phase)
                     .extend(divergence.confirming_peers.clone());
                 pending_conclusions.observe_divergence(divergence_phase, &divergence);
@@ -859,10 +869,10 @@ impl BlockRangeSyncer {
                     !task_handles.is_empty(),
                 ) {
                     info!(
-                        "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this segment."
+                        "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this range."
                     );
                     if candidate_exhaustion_deserves_backoff(target.slot, head_slot) {
-                        self.next_segment_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
+                        self.next_range_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
                     }
                     pending_conclusions.observe(
                         phase,
@@ -912,15 +922,15 @@ impl BlockRangeSyncer {
             }
 
             if recovery_window_open
-                && !recovery_decision_made_this_segment
+                && !recovery_decision_made_this_range
                 && let Some(frontier) = self.frontier_for(phase)
                 && frontier.needs_recovery(&observation, block_cache.next_start_slot())
             {
-                recovery_decision_made_this_segment = true;
+                recovery_decision_made_this_range = true;
                 recovery_window_open = false;
                 let recovery_round_not_before = frontier.recovery_round_not_before;
                 if recovery_round_not_before.is_none_or(|not_before| now >= not_before) {
-                    let mut excluded = segment_exclusions.for_phase(phase).clone();
+                    let mut excluded = range_exclusions.for_phase(phase).clone();
                     excluded.extend(frontier.attempted_peers.iter().copied());
                     match self
                         .run_recovery(&observation, &candidate_peers, &excluded)
@@ -1331,7 +1341,7 @@ impl BlockRangeSyncer {
         }
 
         info!(
-            "Block range sync completed a segment successfully with {} blocks and {} blobs.",
+            "Block range sync completed a range successfully with {} blocks and {} blobs.",
             block_cache.block_count(),
             block_cache.downloaded_blob_count(),
         );
@@ -1353,7 +1363,7 @@ impl BlockRangeSyncer {
         if imported_count > 0 {
             self.clear_tracker();
         } else if import_result.is_ok() {
-            self.commit_pending_conclusions(pending_conclusions, segment_exclusions);
+            self.commit_pending_conclusions(pending_conclusions, range_exclusions);
         }
 
         let target_was_ahead = finalized_target_was_ahead
@@ -1361,7 +1371,7 @@ impl BlockRangeSyncer {
                 .as_ref()
                 .is_some_and(|target| target.slot > head_slot);
         if target_was_ahead && saw_empty_range && imported_count == 0 {
-            self.next_segment_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
+            self.next_range_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
         }
 
         import_result.map(|_| ()).map_err(|err| err.error)
@@ -1713,8 +1723,21 @@ fn poll_ready_tasks(
 
                         if blocks.is_empty() {
                             info!("Received empty block range from peer: {peer_id}");
-                            block_cache.clear_attempted(key);
                             *saw_empty_range = true;
+
+                            let range_end = range.start_slot.saturating_add(range.count);
+                            let reaches_head_target = matching_frontier.is_some_and(|frontier| {
+                                frontier.phase == SyncPhase::Head
+                                    && range.start_slot <= frontier.highest_observed_target
+                                    && range_end > frontier.highest_observed_target
+                            });
+                            if reaches_head_target {
+                                block_cache.mark_attempted(key, *peer_id, candidate_peers, now);
+                                block_cache.push_retry_range(*range);
+                                continue;
+                            }
+
+                            block_cache.clear_attempted(key);
 
                             if let Some(frontier) = matching_frontier {
                                 let observation = observation_from_frontier(frontier);
@@ -2286,7 +2309,8 @@ mod tests {
     use kzg::{G1, eip_4844::compute_blob_kzg_proof_raw};
     use parking_lot::RwLock;
     use ream_consensus_beacon::{
-        data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::BeaconBlock,
+        data_column_sidecar::NUMBER_OF_COLUMNS,
+        electra::{beacon_block::BeaconBlock, beacon_state::BeaconState},
     };
     use ream_consensus_misc::{
         checkpoint::Checkpoint,
@@ -2295,11 +2319,18 @@ mod tests {
     use ream_execution_rpc_types::get_blobs::{Blob, BlobAndProofV1};
     use ream_network_spec::networks::beacon::initialize_test_network_spec;
     use ream_operation_pool::OperationPool;
-    use ream_p2p::network::beacon::peer::CachedPeer;
+    use ream_p2p::network::beacon::{
+        channel::{P2PCallbackResponse, P2PRequest},
+        peer::CachedPeer,
+    };
     use ream_peer::{ConnectionState, Direction};
-    use ream_req_resp::beacon::messages::{meta_data::GetMetaDataV3, status::Status};
+    use ream_req_resp::beacon::messages::{
+        BeaconResponseMessage, meta_data::GetMetaDataV3, status::Status,
+    };
     use ream_storage::{db::ReamDB, tables::field::REDBField};
     use ream_sync_committee_pool::SyncCommitteePool;
+    use snap::raw::Decoder;
+    use ssz::Decode;
     use tempfile::TempDir;
 
     use super::*;
@@ -2329,6 +2360,25 @@ mod tests {
         assert!(candidate_exhaustion_deserves_backoff(100, 50));
         assert!(!candidate_exhaustion_deserves_backoff(50, 50));
         assert!(!candidate_exhaustion_deserves_backoff(50, 100));
+    }
+
+    #[test]
+    fn finalized_phase_waits_on_no_quorum_and_advances_only_after_reaching_a_target() {
+        assert!(!finalized_target_reached(&TargetSelection::NoQuorum, 100));
+        assert!(!finalized_target_reached(
+            &TargetSelection::Ready {
+                target_slot: 101,
+                eligible_peers: Vec::new(),
+            },
+            100,
+        ));
+        assert!(finalized_target_reached(
+            &TargetSelection::Ready {
+                target_slot: 100,
+                eligible_peers: Vec::new(),
+            },
+            100,
+        ));
     }
 
     #[test]
@@ -2423,6 +2473,17 @@ mod tests {
         (data_dir, beacon_chain)
     }
 
+    fn test_beacon_state() -> BeaconState {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../testing/gossip-validation/tests/assets/sepolia/states/grandparent_state_9552074.ssz_snappy",
+        );
+        let compressed = std::fs::read(path).expect("test beacon state should be readable");
+        let bytes = Decoder::new()
+            .decompress_vec(&compressed)
+            .expect("test beacon state should decompress");
+        BeaconState::from_ssz_bytes(&bytes).expect("test beacon state should decode")
+    }
+
     fn test_network_state() -> Arc<NetworkState> {
         let enr_key = CombinedKey::generate_secp256k1();
         Arc::new(NetworkState {
@@ -2485,12 +2546,12 @@ mod tests {
         panic!("task did not complete within the test timeout");
     }
 
-    /// `start()` must hand `self` back out even on an ordinary segment error, not just success,
+    /// `start()` must hand `self` back out even on an ordinary range error, not just success,
     /// or the caller loses the syncer (and its warmed-up peer table) and can never retry.
     #[test]
-    fn start_returns_self_after_a_failed_segment() {
+    fn start_returns_self_after_a_failed_range() {
         initialize_test_network_spec();
-        // Empty DB has no highest synced slot, so run_segment fails immediately.
+        // Empty DB has no highest synced slot, so run_range_sync fails immediately.
         let (_data_dir, beacon_chain) = test_beacon_chain();
         let executor = ReamExecutor::new().expect("executor should start");
         let (p2p_sender, _p2p_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2507,9 +2568,165 @@ mod tests {
             .expect("task should not panic")
             .expect("task should not be cancelled by shutdown");
 
-        assert!(
-            sync_result.is_err(),
-            "expected the empty-DB segment to fail"
+        assert!(sync_result.is_err(), "expected the empty-DB range to fail");
+    }
+
+    #[test]
+    fn head_fork_recovery_walks_by_root_to_the_common_ancestor_without_gossip() {
+        futures::executor::block_on(
+            head_fork_recovery_walks_by_root_to_the_common_ancestor_without_gossip_inner(),
+        );
+    }
+
+    async fn head_fork_recovery_walks_by_root_to_the_common_ancestor_without_gossip_inner() {
+        initialize_test_network_spec();
+        let (_data_dir, beacon_chain) = test_beacon_chain();
+
+        let common_block = SignedBeaconBlock {
+            message: BeaconBlock::default(),
+            signature: Default::default(),
+        };
+        let common_root = common_block.message.tree_hash_root();
+        {
+            let store = beacon_chain.store.lock().await;
+            store
+                .db
+                .block_provider()
+                .insert(common_root, common_block)
+                .expect("common block should be stored");
+            store
+                .db
+                .state_provider()
+                .insert(common_root, test_beacon_state())
+                .expect("common state should be stored");
+            store
+                .db
+                .finalized_checkpoint_provider()
+                .insert(Checkpoint {
+                    epoch: 0,
+                    root: common_root,
+                })
+                .expect("finalized checkpoint should be stored");
+        }
+
+        let mut remote_blocks = HashMap::new();
+        let mut remote_parent = common_root;
+        for slot in 1..=12 {
+            let block = SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot,
+                    parent_root: remote_parent,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            };
+            remote_parent = block.message.tree_hash_root();
+            remote_blocks.insert(remote_parent, block);
+        }
+        let remote_head = remote_parent;
+        let local_anchor = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: 11,
+                proposer_index: 999,
+                parent_root: common_root,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+        .message
+        .tree_hash_root();
+
+        let peer_id = PeerId::random();
+        let network_state = test_network_state();
+        let mut peer = CachedPeer::new(
+            peer_id,
+            None,
+            ConnectionState::Connected,
+            Direction::Outbound,
+            None,
+        );
+        peer.status = Some(Status {
+            finalized_root: common_root,
+            finalized_epoch: 0,
+            head_root: remote_head,
+            head_slot: 12,
+            earliest_available_slot: 0,
+            ..Default::default()
+        });
+        network_state.peer_table.write().insert(peer_id, peer);
+
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (p2p_sender, mut p2p_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let responder = executor.spawn(async move {
+            while let Some(message) = p2p_receiver.recv().await {
+                let P2PMessage::Request(P2PRequest::BlockRoots {
+                    roots, callback, ..
+                }) = message
+                else {
+                    panic!("head-fork recovery should use only by-root requests");
+                };
+                for root in roots {
+                    if let Some(block) = remote_blocks.get(&root) {
+                        callback
+                            .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(
+                                BeaconResponseMessage::BeaconBlocksByRoot(block.clone()),
+                            ))))
+                            .await
+                            .expect("response receiver should remain open");
+                    }
+                }
+                callback
+                    .send(Ok(P2PCallbackResponse::EndOfStream))
+                    .await
+                    .expect("response receiver should remain open");
+            }
+        });
+
+        let mut syncer =
+            BlockRangeSyncer::new(Arc::new(beacon_chain), p2p_sender, network_state, executor);
+        syncer.peer_manager.update_peer_set();
+        let frontier_id = FrontierId {
+            key: FrontierKey {
+                anchor_root: local_anchor,
+                phase: SyncPhase::Head,
+                scan_start_slot: 11,
+            },
+            generation: syncer.allocate_generation(),
+        };
+        let mut frontier = test_frontier(frontier_id, local_anchor, 11);
+        frontier.highest_observed_target = 12;
+        frontier.consecutive_no_progress = 6;
+        syncer.head_frontier = Some(frontier);
+        let observation = FrontierObservation {
+            anchor_root: local_anchor,
+            anchor_slot: 11,
+            phase: SyncPhase::Head,
+            scan_start_slot: 11,
+            target_slot: 12,
+        };
+
+        let outcome = syncer
+            .run_recovery(&observation, &[peer_id], &HashSet::new())
+            .await
+            .expect("head-fork recovery should complete");
+        responder.abort();
+
+        let RecoveryOutcome::Seeded(seed) = outcome else {
+            panic!("expected a recovery seed after reaching the common ancestor");
+        };
+        assert_eq!(seed.ancestor_root, common_root);
+        assert_eq!(seed.ancestor_slot, 0);
+        assert_eq!(seed.source_peer, peer_id);
+        assert_eq!(
+            seed.forward_blocks
+                .iter()
+                .map(|block| block.message.slot)
+                .collect::<Vec<_>>(),
+            (1..=12).collect::<Vec<_>>()
+        );
+        assert_ne!(
+            seed.forward_blocks[10].message.tree_hash_root(),
+            local_anchor
         );
     }
 
@@ -3239,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_at_target_does_not_consume_the_segments_recovery_decision() {
+    fn coverage_at_target_does_not_consume_the_ranges_recovery_decision() {
         let frontier = test_frontier(test_frontier_id(0), B256::ZERO, 10);
         let observation = FrontierObservation {
             anchor_root: B256::ZERO,
@@ -3412,6 +3629,71 @@ mod tests {
     }
 
     #[test]
+    fn empty_head_target_range_is_retried_instead_of_becoming_coverage() {
+        initialize_test_network_spec();
+        let executor = ReamExecutor::new().expect("executor should start");
+        let (mut peer_manager, peer_id) = test_peer_manager_with_one_peer();
+
+        let root = B256::ZERO;
+        let frontier_id = FrontierId {
+            key: FrontierKey {
+                anchor_root: root,
+                phase: SyncPhase::Head,
+                scan_start_slot: 100,
+            },
+            generation: 0,
+        };
+        let mut frontier = test_frontier(frontier_id, root, 100);
+        frontier.highest_observed_target = 110;
+        let range = Range::new(101, 10);
+        let key = RequestKey::BlockRange(range);
+        let mut block_cache = BlockCache::new(root, 100);
+        block_cache.mark_block_range_in_progress(range);
+        let handle =
+            executor.spawn(async move { StreamOutcome::Complete(Vec::<SignedBeaconBlock>::new()) });
+        let mut tasks = vec![DownloadTask::new_block_range(
+            handle,
+            range,
+            peer_id,
+            Some(frontier_id),
+        )];
+
+        let mut finalized_frontier = None;
+        let mut head_frontier = Some(frontier);
+        let mut saw_empty_range = false;
+        for _ in 0..500 {
+            let mut frontiers = FrontierStore {
+                finalized: &mut finalized_frontier,
+                head: &mut head_frontier,
+            };
+            poll_ready_tasks(
+                &mut tasks,
+                &mut block_cache,
+                &mut peer_manager,
+                &mut frontiers,
+                &HashSet::new(),
+                &mut saw_empty_range,
+                &[peer_id],
+            )
+            .expect("poll_ready_tasks should not error");
+            if tasks.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(
+            head_frontier
+                .as_ref()
+                .expect("head frontier should remain")
+                .confirmed_empty_through
+                .is_none()
+        );
+        assert!(block_cache.attempted_peers_for(key).contains(&peer_id));
+        assert_eq!(block_cache.next_start_slot(), 100);
+    }
+
+    #[test]
     fn coverage_divergence_implicates_the_confirming_peers_not_the_block_serving_peer() {
         initialize_test_network_spec();
         let executor = ReamExecutor::new().expect("executor should start");
@@ -3539,13 +3821,13 @@ mod tests {
                 .expect("set above")
                 .reason,
             RemoteNoProgressReason::SettledEmptyCoverage,
-            "a segment producing evidence for both phases must not let one silently overwrite the other"
+            "a range producing evidence for both phases must not let one silently overwrite the other"
         );
     }
 
     #[test]
-    fn segment_exclusions_stay_scoped_to_their_own_phase() {
-        let mut exclusions = SegmentExclusions::default();
+    fn range_exclusions_stay_scoped_to_their_own_phase() {
+        let mut exclusions = RangeExclusions::default();
         let peer = PeerId::random();
         exclusions.for_phase_mut(SyncPhase::Finalized).insert(peer);
 
@@ -3720,7 +4002,7 @@ mod tests {
         assert_eq!(
             first_deadline, second_deadline,
             "an already-armed cooldown must not be re-extended by a later commit, or it would \
-             never elapse if segments repeat faster than the cooldown duration"
+             never elapse if ranges repeat faster than the cooldown duration"
         );
     }
 
