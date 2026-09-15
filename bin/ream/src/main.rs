@@ -1897,9 +1897,48 @@ mod tests {
             .to_string()
     }
 
+    fn remove_beacon_slot_indexes(db: &ReamDB, start_slot: u64, end_slot: u64) {
+        let beacon_db = db
+            .init_beacon_db()
+            .expect("unable to open Ream Beacon Database");
+        let mut removed = 0;
+
+        for slot in start_slot..=end_slot {
+            let Some(block_root) = beacon_db
+                .slot_index_provider()
+                .remove(slot)
+                .expect("slot index removal should succeed")
+            else {
+                continue;
+            };
+            assert!(
+                beacon_db
+                    .block_provider()
+                    .get(block_root)
+                    .expect("block lookup should succeed")
+                    .is_some(),
+                "removing a slot index must retain the block for by-root recovery"
+            );
+            removed += 1;
+        }
+
+        assert!(
+            removed > 0,
+            "at least one block-range slot index must be removed"
+        );
+        assert!(
+            beacon_db
+                .slot_index_provider()
+                .get(end_slot)
+                .expect("slot index lookup should succeed")
+                .is_none(),
+            "the target block must be unavailable through block-by-range"
+        );
+    }
+
     async fn wait_for_head_to_match(http_port: u16, target_slot: u64, target_root: &str) {
         let start = Instant::now();
-        let timeout_duration = Duration::from_secs(180);
+        let timeout_duration = Duration::from_secs(300);
         loop {
             let head = wait_for_beacon_json(http_port, "/eth/v1/beacon/headers").await;
             let (slot, root) = head_slot_and_root(&head);
@@ -2902,7 +2941,7 @@ mod tests {
             let node_b1_restart_http_port = node_b1_restart_config.http_port;
             let node_b1_restart_handle = spawn_beacon_test_node(
                 node_b1_restart_config,
-                node_b1_db_for_restart,
+                node_b1_db_for_restart.clone(),
                 node_b1_restart_executor_handle.clone(),
             );
             let node_b1_restart_identity =
@@ -2920,7 +2959,7 @@ mod tests {
             let node_b2_restart_http_port = node_b2_restart_config.http_port;
             let node_b2_restart_handle = spawn_beacon_test_node(
                 node_b2_restart_config,
-                node_b2_db_for_restart,
+                node_b2_db_for_restart.clone(),
                 node_b2_restart_executor_handle.clone(),
             );
             let node_b2_restart_identity =
@@ -2938,7 +2977,7 @@ mod tests {
             let node_b3_restart_http_port = node_b3_restart_config.http_port;
             let node_b3_restart_handle = spawn_beacon_test_node(
                 node_b3_restart_config,
-                node_b3_db_for_restart,
+                node_b3_db_for_restart.clone(),
                 node_b3_restart_executor_handle.clone(),
             );
             let node_b3_restart_identity =
@@ -2959,12 +2998,24 @@ mod tests {
             .await;
             assert_eq!(node_b_head, restarted_peer_head);
 
+            for db in [
+                &node_b1_db_for_restart,
+                &node_b2_db_for_restart,
+                &node_b3_db_for_restart,
+            ] {
+                remove_beacon_slot_indexes(db, node_a_head.0 + 1, node_b_head.0);
+            }
+
             let bootnodes = [
                 node_b1_restart_enr,
                 node_b2_restart_enr,
                 node_b3_restart_enr,
             ]
             .join(",");
+            let _range_sync_timing = ream_syncer::block_range::override_range_sync_timing(
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            );
             let mut node_a_restart_config =
                 beacon_node_config_from_args(port_offset + 8, Some(bootnodes));
             node_a_restart_config.disable_discovery = true;

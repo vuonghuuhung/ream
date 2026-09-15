@@ -650,8 +650,16 @@ impl BlockCache {
             return DataToFetch::DownloadsInProgress;
         }
 
+        let has_retry_ranges = !self.block_ranges_to_retry.is_empty();
         if let Some(range) = self.take_schedulable_retry_range(candidate_peers, now) {
             return DataToFetch::BlockRange(range);
+        }
+
+        if has_retry_ranges
+            && !candidate_peers.is_empty()
+            && self.block_ranges_in_progress.is_empty()
+        {
+            return DataToFetch::Finished;
         }
 
         let estimated_blocks_to_fetch = self.estimated_blocks_to_fetch();
@@ -986,6 +994,26 @@ mod tests {
         cache.remove_block_range_in_progress(&range);
         assert_eq!(
             cache.data_to_fetch(10, 0, &HashSet::new(), &[], Instant::now(), false),
+            DataToFetch::Finished
+        );
+    }
+
+    #[test]
+    fn data_to_fetch_finishes_after_all_candidates_exhaust_a_retry_range() {
+        initialize_test_network_spec();
+        let mut cache = BlockCache::new(B256::ZERO, 10);
+        let range = Range::new(11, 4);
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let candidates = [peer_a, peer_b];
+        let now = Instant::now();
+
+        cache.push_retry_range(range);
+        cache.mark_attempted(RequestKey::BlockRange(range), peer_a, &candidates, now);
+        cache.mark_attempted(RequestKey::BlockRange(range), peer_b, &candidates, now);
+
+        assert_eq!(
+            cache.data_to_fetch(14, 0, &HashSet::new(), &candidates, now, true),
             DataToFetch::Finished
         );
     }

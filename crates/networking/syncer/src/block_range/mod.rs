@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "devnet5")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use alloy_primitives::B256;
 use anyhow::{anyhow, bail, ensure};
 use block_cache::{AddBlocksError, BlockAndBlobBundle, BlockCache, DataToFetch, RequestKey};
@@ -69,6 +72,61 @@ const SLOT_IMPORT_TOLERANCE: u64 = 32;
 
 const ZERO_PROGRESS_BACKOFF: Duration = Duration::from_secs(30);
 
+#[cfg(feature = "devnet5")]
+static ZERO_PROGRESS_BACKOFF_OVERRIDE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(feature = "devnet5")]
+static DOWNLOAD_POLL_DELAY_OVERRIDE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(feature = "devnet5")]
+pub struct RangeSyncTimingOverride {
+    previous_backoff_ms: u64,
+    previous_poll_delay_ms: u64,
+}
+
+#[cfg(feature = "devnet5")]
+impl Drop for RangeSyncTimingOverride {
+    fn drop(&mut self) {
+        ZERO_PROGRESS_BACKOFF_OVERRIDE_MS.store(self.previous_backoff_ms, Ordering::Relaxed);
+        DOWNLOAD_POLL_DELAY_OVERRIDE_MS.store(self.previous_poll_delay_ms, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "devnet5")]
+pub fn override_range_sync_timing(
+    zero_progress_backoff: Duration,
+    download_poll_delay: Duration,
+) -> RangeSyncTimingOverride {
+    RangeSyncTimingOverride {
+        previous_backoff_ms: ZERO_PROGRESS_BACKOFF_OVERRIDE_MS
+            .swap(zero_progress_backoff.as_millis() as u64, Ordering::Relaxed),
+        previous_poll_delay_ms: DOWNLOAD_POLL_DELAY_OVERRIDE_MS
+            .swap(download_poll_delay.as_millis() as u64, Ordering::Relaxed),
+    }
+}
+
+fn zero_progress_backoff() -> Duration {
+    #[cfg(feature = "devnet5")]
+    {
+        let override_ms = ZERO_PROGRESS_BACKOFF_OVERRIDE_MS.load(Ordering::Relaxed);
+        if override_ms != u64::MAX {
+            return Duration::from_millis(override_ms);
+        }
+    }
+    ZERO_PROGRESS_BACKOFF
+}
+
+fn download_poll_delay() -> Duration {
+    #[cfg(feature = "devnet5")]
+    {
+        let override_ms = DOWNLOAD_POLL_DELAY_OVERRIDE_MS.load(Ordering::Relaxed);
+        if override_ms != u64::MAX {
+            return Duration::from_millis(override_ms);
+        }
+    }
+    Duration::from_secs(10)
+}
+
 const RECOVERY_ATTEMPT_COOLDOWN: Duration = Duration::from_secs(30);
 
 const CANDIDATE_EXHAUSTION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -79,6 +137,17 @@ fn should_abort_for_candidate_exhaustion(elapsed: Duration, tasks_in_flight: boo
 
 fn candidate_exhaustion_deserves_backoff(target_slot: u64, head_slot: u64) -> bool {
     target_slot > head_slot
+}
+
+fn range_settled_without_progress(
+    block_count: u64,
+    next_start_slot: u64,
+    target_slot: u64,
+    head_slot: u64,
+    saw_empty_range: bool,
+) -> bool {
+    block_count == 0
+        && (next_start_slot < target_slot || (target_slot > head_slot && saw_empty_range))
 }
 
 fn finalized_target_reached(selection: &TargetSelection, next_start_slot: u64) -> bool {
@@ -706,6 +775,7 @@ impl BlockRangeSyncer {
         let mut phase = SyncPhase::Finalized;
         let mut active_target: Option<ActivePhaseTarget> = None;
         let mut saw_empty_range = false;
+        let mut saw_empty_range_in_completed_phase = false;
         let mut finalized_phase_settled = false;
         let mut finalized_target_was_ahead = false;
         let mut candidate_exhausted_since: Option<Instant> = None;
@@ -742,6 +812,8 @@ impl BlockRangeSyncer {
             if active_target.is_none() {
                 if phase == SyncPhase::Finalized {
                     if finalized_target_reached(&selection, block_cache.next_start_slot()) {
+                        saw_empty_range_in_completed_phase |= saw_empty_range;
+                        saw_empty_range = false;
                         phase = SyncPhase::Head;
                         continue;
                     }
@@ -872,7 +944,7 @@ impl BlockRangeSyncer {
                         "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this range."
                     );
                     if candidate_exhaustion_deserves_backoff(target.slot, head_slot) {
-                        self.next_range_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
+                        self.next_range_not_before = Some(Instant::now() + zero_progress_backoff());
                     }
                     pending_conclusions.observe(
                         phase,
@@ -1314,19 +1386,26 @@ impl BlockRangeSyncer {
                         "Waiting for ongoing downloads to complete... {}",
                         self.peer_manager.peer_counts()
                     );
-                    sleep(Duration::from_secs(10)).await;
+                    sleep(download_poll_delay()).await;
                 }
                 DataToFetch::Finished => {
                     if phase == SyncPhase::Finalized && block_cache.next_start_slot() >= target.slot
                     {
                         finalized_target_was_ahead = target.slot > head_slot;
+                        saw_empty_range_in_completed_phase |= saw_empty_range;
+                        saw_empty_range = false;
                         phase = SyncPhase::Head;
                         active_target = None;
                         finalized_phase_settled = true;
                         continue;
                     }
-                    if block_cache.block_count() == 0 && block_cache.next_start_slot() < target.slot
-                    {
+                    if range_settled_without_progress(
+                        block_cache.block_count(),
+                        block_cache.next_start_slot(),
+                        target.slot,
+                        head_slot,
+                        saw_empty_range,
+                    ) {
                         pending_conclusions.observe(
                             phase,
                             observation.clone(),
@@ -1370,8 +1449,11 @@ impl BlockRangeSyncer {
             || active_target
                 .as_ref()
                 .is_some_and(|target| target.slot > head_slot);
-        if target_was_ahead && saw_empty_range && imported_count == 0 {
-            self.next_range_not_before = Some(Instant::now() + ZERO_PROGRESS_BACKOFF);
+        if target_was_ahead
+            && (saw_empty_range_in_completed_phase || saw_empty_range)
+            && imported_count == 0
+        {
+            self.next_range_not_before = Some(Instant::now() + zero_progress_backoff());
         }
 
         import_result.map(|_| ()).map_err(|err| err.error)
@@ -2360,6 +2442,13 @@ mod tests {
         assert!(candidate_exhaustion_deserves_backoff(100, 50));
         assert!(!candidate_exhaustion_deserves_backoff(50, 50));
         assert!(!candidate_exhaustion_deserves_backoff(50, 100));
+    }
+
+    #[test]
+    fn empty_range_at_reserved_target_counts_as_no_progress() {
+        assert!(range_settled_without_progress(0, 100, 100, 90, true));
+        assert!(!range_settled_without_progress(0, 100, 100, 90, false));
+        assert!(!range_settled_without_progress(1, 100, 100, 90, true));
     }
 
     #[test]
