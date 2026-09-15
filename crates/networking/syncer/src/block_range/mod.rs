@@ -3,6 +3,8 @@ mod peer_manager;
 mod peer_range_downloader;
 mod recovery;
 
+#[cfg(feature = "devnet5")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashSet,
     pin::Pin,
@@ -10,9 +12,6 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-
-#[cfg(feature = "devnet5")]
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::B256;
 use anyhow::{anyhow, bail, ensure};
