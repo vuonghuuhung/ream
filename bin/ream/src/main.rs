@@ -1870,6 +1870,51 @@ mod tests {
         }
     }
 
+    async fn wait_for_connected_beacon_peers(http_port: u16, minimum: u64) {
+        let start = Instant::now();
+        let timeout_duration = Duration::from_secs(60);
+        loop {
+            let peer_count = wait_for_beacon_json(http_port, "/eth/v1/node/peer_count").await;
+            let connected = peer_count_connected(&peer_count);
+            if connected >= minimum {
+                return;
+            }
+
+            assert!(
+                start.elapsed() < timeout_duration,
+                "Timed out waiting for beacon node on port {http_port} to connect to {minimum} peers; latest response: {peer_count:?}"
+            );
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    async fn beacon_block_root_at_slot(http_port: u16, slot: u64) -> String {
+        let response =
+            wait_for_beacon_json(http_port, &format!("/eth/v1/beacon/blocks/{slot}/root")).await;
+        response["data"]["root"]
+            .as_str()
+            .unwrap_or_else(|| panic!("block root response missing root: {response:?}"))
+            .to_string()
+    }
+
+    async fn wait_for_head_to_match(http_port: u16, target_slot: u64, target_root: &str) {
+        let start = Instant::now();
+        let timeout_duration = Duration::from_secs(180);
+        loop {
+            let head = wait_for_beacon_json(http_port, "/eth/v1/beacon/headers").await;
+            let (slot, root) = head_slot_and_root(&head);
+            if slot == target_slot && root == target_root {
+                return;
+            }
+
+            assert!(
+                start.elapsed() < timeout_duration,
+                "Timed out waiting for beacon node on port {http_port} to reach ({target_slot}, {target_root}); latest head: ({slot}, {root})"
+            );
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     async fn wait_for_matching_heads_all(http_ports: &[u16]) -> (u64, String) {
         assert!(
             !http_ports.is_empty(),
@@ -2673,6 +2718,304 @@ mod tests {
             ?node_2_finality,
             ?validators_finished,
             "Beacon block production e2e test completed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_beacon_node_recovers_head_fork_via_range_sync() {
+        init_test_tracing();
+
+        let port_offset = beacon_port_offset();
+        let mut node_a_config = beacon_node_config_from_args(port_offset, None);
+        initialize_beacon_e2e_network_spec(node_a_config.network.clone());
+        let public_keys = beacon_e2e_public_keys();
+        let (genesis_state, genesis_block) = build_dev_genesis(&public_keys);
+        let genesis_execution_block_hash = genesis_state.latest_execution_payload_header.block_hash;
+
+        let node_a_db = create_beacon_test_node_db("beacon_head_fork_recovery", 1);
+        let node_b1_db = create_beacon_test_node_db("beacon_head_fork_recovery", 2);
+        let node_b2_db = create_beacon_test_node_db("beacon_head_fork_recovery", 3);
+        let node_b3_db = create_beacon_test_node_db("beacon_head_fork_recovery", 4);
+        let genesis_validators_root =
+            seed_beacon_test_db(&node_a_db, genesis_state.clone(), &genesis_block);
+        for db in [&node_b1_db, &node_b2_db, &node_b3_db] {
+            let peer_genesis_root = seed_beacon_test_db(db, genesis_state.clone(), &genesis_block);
+            assert_eq!(
+                genesis_validators_root, peer_genesis_root,
+                "head-fork e2e nodes must share genesis"
+            );
+        }
+        initialize_beacon_e2e_genesis_root(genesis_validators_root);
+
+        let control_executor = ReamExecutor::new().unwrap();
+        let node_a_executor = ReamExecutor::new().unwrap();
+        let node_a_restart_executor = ReamExecutor::new().unwrap();
+        let node_b1_executor = ReamExecutor::new().unwrap();
+        let node_b2_executor = ReamExecutor::new().unwrap();
+        let node_b3_executor = ReamExecutor::new().unwrap();
+        let node_b1_restart_executor = ReamExecutor::new().unwrap();
+        let node_b2_restart_executor = ReamExecutor::new().unwrap();
+        let node_b3_restart_executor = ReamExecutor::new().unwrap();
+        let validator_a_executor = ReamExecutor::new().unwrap();
+        let validator_b_executor = ReamExecutor::new().unwrap();
+
+        let node_a_executor_handle = node_a_executor.clone();
+        let node_a_restart_executor_handle = node_a_restart_executor.clone();
+        let node_b1_executor_handle = node_b1_executor.clone();
+        let node_b2_executor_handle = node_b2_executor.clone();
+        let node_b3_executor_handle = node_b3_executor.clone();
+        let node_b1_restart_executor_handle = node_b1_restart_executor.clone();
+        let node_b2_restart_executor_handle = node_b2_restart_executor.clone();
+        let node_b3_restart_executor_handle = node_b3_restart_executor.clone();
+        let validator_a_executor_handle = validator_a_executor.clone();
+        let validator_b_executor_handle = validator_b_executor.clone();
+        let node_a_db_for_restart = node_a_db.clone();
+        let node_b1_db_for_restart = node_b1_db.clone();
+        let node_b2_db_for_restart = node_b2_db.clone();
+        let node_b3_db_for_restart = node_b3_db.clone();
+
+        let result = control_executor.clone().runtime().block_on(async move {
+            let test_dir = temp_dir().join(format!(
+                "{APP_NAME}_beacon_head_fork_recovery_{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("System time is before UNIX epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&test_dir).expect("Failed to create beacon e2e test dir");
+            let jwt_secret_path = test_dir.join("jwt.hex");
+            fs::write(
+                &jwt_secret_path,
+                "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+            )
+            .expect("Failed to write mock EL JWT secret");
+
+            let mock_execution_server = MockExecutionServer::start(genesis_execution_block_hash);
+            let execution_endpoint = mock_execution_server.url();
+
+            node_a_config.disable_discovery = true;
+            node_a_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_a_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_a_http_port = node_a_config.http_port;
+            let node_a_handle =
+                spawn_beacon_test_node(node_a_config, node_a_db, node_a_executor_handle.clone());
+            wait_for_beacon_identity(node_a_http_port).await;
+
+            let mut node_b1_config = beacon_node_config_from_args(port_offset + 1, None);
+            node_b1_config.disable_discovery = true;
+            node_b1_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_b1_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_b1_http_port = node_b1_config.http_port;
+            let node_b1_handle =
+                spawn_beacon_test_node(node_b1_config, node_b1_db, node_b1_executor_handle.clone());
+            let node_b1_identity = wait_for_beacon_identity(node_b1_http_port).await;
+            let node_b1_enr = node_b1_identity["data"]["enr"]
+                .as_str()
+                .expect("identity response should contain ENR")
+                .to_string();
+
+            let mut node_b2_config =
+                beacon_node_config_from_args(port_offset + 2, Some(node_b1_enr.clone()));
+            node_b2_config.disable_discovery = true;
+            node_b2_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_b2_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_b2_http_port = node_b2_config.http_port;
+            let node_b2_handle =
+                spawn_beacon_test_node(node_b2_config, node_b2_db, node_b2_executor_handle.clone());
+            wait_for_beacon_identity(node_b2_http_port).await;
+
+            let mut node_b3_config =
+                beacon_node_config_from_args(port_offset + 3, Some(node_b1_enr.clone()));
+            node_b3_config.disable_discovery = true;
+            node_b3_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_b3_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_b3_http_port = node_b3_config.http_port;
+            let node_b3_handle =
+                spawn_beacon_test_node(node_b3_config, node_b3_db, node_b3_executor_handle.clone());
+            wait_for_beacon_identity(node_b3_http_port).await;
+
+            wait_for_connected_beacon_peers(node_b1_http_port, 2).await;
+            wait_for_connected_beacon_peers(node_b2_http_port, 1).await;
+            wait_for_connected_beacon_peers(node_b3_http_port, 1).await;
+
+            let fork_a_dir = test_dir.join("fork_a");
+            let fork_b_dir = test_dir.join("fork_b");
+            let (fork_a_keystores, fork_a_password) =
+                write_validator_keystores(&fork_a_dir, 0, 0..BEACON_E2E_VALIDATOR_COUNT);
+            let (fork_b_keystores, fork_b_password) =
+                write_validator_keystores(&fork_b_dir, 0, 0..BEACON_E2E_VALIDATOR_COUNT);
+            let validator_a_config = validator_node_config_from_args(
+                node_a_http_port,
+                &fork_a_keystores,
+                &fork_a_password,
+            );
+            let mut validator_b_config = validator_node_config_from_args(
+                node_b1_http_port,
+                &fork_b_keystores,
+                &fork_b_password,
+            );
+            validator_b_config.suggested_fee_recipient =
+                "0x0000000000000000000000000000000000000002"
+                    .parse()
+                    .expect("alternate fee recipient should parse");
+            let validator_a_handle =
+                spawn_validator_test_node(validator_a_config, validator_a_executor_handle.clone());
+            let validator_b_handle =
+                spawn_validator_test_node(validator_b_config, validator_b_executor_handle.clone());
+
+            let first_a = wait_for_head_slot_at_least(node_a_http_port, 1).await;
+            let first_b = wait_for_head_slot_at_least(node_b1_http_port, 1).await;
+            let fork_slot = first_a.0.max(first_b.0) + 4;
+            wait_for_head_slot_at_least(node_a_http_port, fork_slot).await;
+            wait_for_head_slot_at_least(node_b1_http_port, fork_slot).await;
+
+            shutdown_validator_test_node(&validator_a_executor_handle, validator_a_handle).await;
+            let node_a_head = wait_for_head_slot_at_least(node_a_http_port, fork_slot).await;
+            shutdown_beacon_test_node(&node_a_executor_handle, node_a_handle).await;
+
+            wait_for_head_slot_at_least(node_b1_http_port, node_a_head.0 + 4).await;
+            shutdown_validator_test_node(&validator_b_executor_handle, validator_b_handle).await;
+            let node_b_head = wait_for_matching_heads_all(&[
+                node_b1_http_port,
+                node_b2_http_port,
+                node_b3_http_port,
+            ])
+            .await;
+
+            let node_b_root_at_fork_slot =
+                beacon_block_root_at_slot(node_b1_http_port, node_a_head.0).await;
+            assert_ne!(
+                node_a_head.1, node_b_root_at_fork_slot,
+                "isolated validators should have produced different roots at slot {}",
+                node_a_head.0
+            );
+
+            shutdown_beacon_test_node(&node_b3_executor_handle, node_b3_handle).await;
+            shutdown_beacon_test_node(&node_b2_executor_handle, node_b2_handle).await;
+            shutdown_beacon_test_node(&node_b1_executor_handle, node_b1_handle).await;
+
+            let mut node_b1_restart_config = beacon_node_config_from_args(port_offset + 5, None);
+            node_b1_restart_config.disable_discovery = true;
+            node_b1_restart_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_b1_restart_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_b1_restart_http_port = node_b1_restart_config.http_port;
+            let node_b1_restart_handle = spawn_beacon_test_node(
+                node_b1_restart_config,
+                node_b1_db_for_restart,
+                node_b1_restart_executor_handle.clone(),
+            );
+            let node_b1_restart_identity =
+                wait_for_beacon_identity(node_b1_restart_http_port).await;
+            let node_b1_restart_enr = node_b1_restart_identity["data"]["enr"]
+                .as_str()
+                .expect("identity response should contain ENR")
+                .to_string();
+
+            let mut node_b2_restart_config =
+                beacon_node_config_from_args(port_offset + 6, Some(node_b1_restart_enr.clone()));
+            node_b2_restart_config.disable_discovery = true;
+            node_b2_restart_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_b2_restart_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_b2_restart_http_port = node_b2_restart_config.http_port;
+            let node_b2_restart_handle = spawn_beacon_test_node(
+                node_b2_restart_config,
+                node_b2_db_for_restart,
+                node_b2_restart_executor_handle.clone(),
+            );
+            let node_b2_restart_identity =
+                wait_for_beacon_identity(node_b2_restart_http_port).await;
+            let node_b2_restart_enr = node_b2_restart_identity["data"]["enr"]
+                .as_str()
+                .expect("identity response should contain ENR")
+                .to_string();
+
+            let mut node_b3_restart_config =
+                beacon_node_config_from_args(port_offset + 7, Some(node_b1_restart_enr.clone()));
+            node_b3_restart_config.disable_discovery = true;
+            node_b3_restart_config.execution_endpoint = Some(execution_endpoint.clone());
+            node_b3_restart_config.execution_jwt_secret = Some(jwt_secret_path.clone());
+            let node_b3_restart_http_port = node_b3_restart_config.http_port;
+            let node_b3_restart_handle = spawn_beacon_test_node(
+                node_b3_restart_config,
+                node_b3_db_for_restart,
+                node_b3_restart_executor_handle.clone(),
+            );
+            let node_b3_restart_identity =
+                wait_for_beacon_identity(node_b3_restart_http_port).await;
+            let node_b3_restart_enr = node_b3_restart_identity["data"]["enr"]
+                .as_str()
+                .expect("identity response should contain ENR")
+                .to_string();
+
+            wait_for_connected_beacon_peers(node_b1_restart_http_port, 2).await;
+            wait_for_connected_beacon_peers(node_b2_restart_http_port, 1).await;
+            wait_for_connected_beacon_peers(node_b3_restart_http_port, 1).await;
+            let restarted_peer_head = wait_for_matching_heads_all(&[
+                node_b1_restart_http_port,
+                node_b2_restart_http_port,
+                node_b3_restart_http_port,
+            ])
+            .await;
+            assert_eq!(node_b_head, restarted_peer_head);
+
+            let bootnodes = [
+                node_b1_restart_enr,
+                node_b2_restart_enr,
+                node_b3_restart_enr,
+            ]
+            .join(",");
+            let mut node_a_restart_config =
+                beacon_node_config_from_args(port_offset + 8, Some(bootnodes));
+            node_a_restart_config.disable_discovery = true;
+            node_a_restart_config.execution_endpoint = Some(execution_endpoint);
+            node_a_restart_config.execution_jwt_secret = Some(jwt_secret_path);
+            let node_a_restart_http_port = node_a_restart_config.http_port;
+            let node_a_restart_handle = spawn_beacon_test_node(
+                node_a_restart_config,
+                node_a_db_for_restart,
+                node_a_restart_executor_handle.clone(),
+            );
+            wait_for_beacon_identity(node_a_restart_http_port).await;
+            wait_for_connected_beacon_peers(node_a_restart_http_port, 3).await;
+            wait_for_head_to_match(node_a_restart_http_port, node_b_head.0, &node_b_head.1).await;
+
+            let recovered_head =
+                wait_for_beacon_json(node_a_restart_http_port, "/eth/v1/beacon/headers").await;
+            let recovered_head = head_slot_and_root(&recovered_head);
+
+            shutdown_beacon_test_node(&node_a_restart_executor_handle, node_a_restart_handle).await;
+            shutdown_beacon_test_node(&node_b3_restart_executor_handle, node_b3_restart_handle)
+                .await;
+            shutdown_beacon_test_node(&node_b2_restart_executor_handle, node_b2_restart_handle)
+                .await;
+            shutdown_beacon_test_node(&node_b1_restart_executor_handle, node_b1_restart_handle)
+                .await;
+            mock_execution_server.stop().await;
+
+            (node_a_head, node_b_head, recovered_head)
+        });
+
+        validator_b_executor.shutdown_runtime();
+        validator_a_executor.shutdown_runtime();
+        node_b3_executor.shutdown_runtime();
+        node_b2_executor.shutdown_runtime();
+        node_b1_executor.shutdown_runtime();
+        node_b3_restart_executor.shutdown_runtime();
+        node_b2_restart_executor.shutdown_runtime();
+        node_b1_restart_executor.shutdown_runtime();
+        node_a_restart_executor.shutdown_runtime();
+        node_a_executor.shutdown_runtime();
+
+        assert_eq!(
+            result.1, result.2,
+            "restarted node should converge to peer head"
+        );
+        info!(
+            fork_head = ?result.0,
+            target_head = ?result.1,
+            recovered_head = ?result.2,
+            "Beacon head-fork range-sync e2e test completed"
         );
     }
 
