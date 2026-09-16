@@ -25,7 +25,6 @@ devnet5 = [
     "ream-p2p/devnet5",
     "ream-rpc-lean/devnet5",
     "ream-storage/devnet5",
-    "ream-syncer/devnet5",
     "ream-validator-lean/devnet5",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
@@ -100,7 +99,7 @@ ream-validator-lean.workspace = true
 ream-bls.workspace = true
 ream-mock-execution-engine.workspace = true
 ream-req-resp.workspace = true
-ream-syncer.workspace = true
+ream-syncer = { workspace = true, features = ["test-utils"] }
 reqwest.workspace = true
 serial_test = "3.4.0"
 sha2.workspace = true

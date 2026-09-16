@@ -3,8 +3,6 @@ mod peer_manager;
 mod peer_range_downloader;
 mod recovery;
 
-#[cfg(feature = "devnet5")]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashSet,
     pin::Pin,
@@ -71,59 +69,14 @@ const SLOT_IMPORT_TOLERANCE: u64 = 32;
 
 const ZERO_PROGRESS_BACKOFF: Duration = Duration::from_secs(30);
 
-#[cfg(feature = "devnet5")]
-static ZERO_PROGRESS_BACKOFF_OVERRIDE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
-
-#[cfg(feature = "devnet5")]
-static DOWNLOAD_POLL_DELAY_OVERRIDE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
-
-#[cfg(feature = "devnet5")]
-pub struct RangeSyncTimingOverride {
-    previous_backoff_ms: u64,
-    previous_poll_delay_ms: u64,
+#[cfg(feature = "test-utils")]
+fn range_sync_delay(_: Duration) -> Duration {
+    Duration::from_millis(20)
 }
 
-#[cfg(feature = "devnet5")]
-impl Drop for RangeSyncTimingOverride {
-    fn drop(&mut self) {
-        ZERO_PROGRESS_BACKOFF_OVERRIDE_MS.store(self.previous_backoff_ms, Ordering::Relaxed);
-        DOWNLOAD_POLL_DELAY_OVERRIDE_MS.store(self.previous_poll_delay_ms, Ordering::Relaxed);
-    }
-}
-
-#[cfg(feature = "devnet5")]
-pub fn override_range_sync_timing(
-    zero_progress_backoff: Duration,
-    download_poll_delay: Duration,
-) -> RangeSyncTimingOverride {
-    RangeSyncTimingOverride {
-        previous_backoff_ms: ZERO_PROGRESS_BACKOFF_OVERRIDE_MS
-            .swap(zero_progress_backoff.as_millis() as u64, Ordering::Relaxed),
-        previous_poll_delay_ms: DOWNLOAD_POLL_DELAY_OVERRIDE_MS
-            .swap(download_poll_delay.as_millis() as u64, Ordering::Relaxed),
-    }
-}
-
-fn zero_progress_backoff() -> Duration {
-    #[cfg(feature = "devnet5")]
-    {
-        let override_ms = ZERO_PROGRESS_BACKOFF_OVERRIDE_MS.load(Ordering::Relaxed);
-        if override_ms != u64::MAX {
-            return Duration::from_millis(override_ms);
-        }
-    }
-    ZERO_PROGRESS_BACKOFF
-}
-
-fn download_poll_delay() -> Duration {
-    #[cfg(feature = "devnet5")]
-    {
-        let override_ms = DOWNLOAD_POLL_DELAY_OVERRIDE_MS.load(Ordering::Relaxed);
-        if override_ms != u64::MAX {
-            return Duration::from_millis(override_ms);
-        }
-    }
-    Duration::from_secs(10)
+#[cfg(not(feature = "test-utils"))]
+fn range_sync_delay(delay: Duration) -> Duration {
+    delay
 }
 
 const RECOVERY_ATTEMPT_COOLDOWN: Duration = Duration::from_secs(30);
@@ -943,7 +896,8 @@ impl BlockRangeSyncer {
                         "No peer has qualified for the active sync target for over {CANDIDATE_EXHAUSTION_TIMEOUT:?}; ending this range."
                     );
                     if candidate_exhaustion_deserves_backoff(target.slot, head_slot) {
-                        self.next_range_not_before = Some(Instant::now() + zero_progress_backoff());
+                        self.next_range_not_before =
+                            Some(Instant::now() + range_sync_delay(ZERO_PROGRESS_BACKOFF));
                     }
                     pending_conclusions.observe(
                         phase,
@@ -1385,7 +1339,7 @@ impl BlockRangeSyncer {
                         "Waiting for ongoing downloads to complete... {}",
                         self.peer_manager.peer_counts()
                     );
-                    sleep(download_poll_delay()).await;
+                    sleep(range_sync_delay(Duration::from_secs(10))).await;
                 }
                 DataToFetch::Finished => {
                     if phase == SyncPhase::Finalized && block_cache.next_start_slot() >= target.slot
@@ -1452,7 +1406,8 @@ impl BlockRangeSyncer {
             && (saw_empty_range_in_completed_phase || saw_empty_range)
             && imported_count == 0
         {
-            self.next_range_not_before = Some(Instant::now() + zero_progress_backoff());
+            self.next_range_not_before =
+                Some(Instant::now() + range_sync_delay(ZERO_PROGRESS_BACKOFF));
         }
 
         import_result.map(|_| ()).map_err(|err| err.error)

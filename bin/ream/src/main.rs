@@ -3012,10 +3012,6 @@ mod tests {
                 node_b3_restart_enr,
             ]
             .join(",");
-            let _range_sync_timing = ream_syncer::block_range::override_range_sync_timing(
-                Duration::from_millis(20),
-                Duration::from_millis(20),
-            );
             let mut node_a_restart_config =
                 beacon_node_config_from_args(port_offset + 8, Some(bootnodes));
             node_a_restart_config.disable_discovery = true;

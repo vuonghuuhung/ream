@@ -12,6 +12,7 @@ version.workspace = true
 [features]
 default = []
 devnet5 = ["ream-storage/devnet5", "ream-p2p/devnet5"]
+test-utils = []
 
 [dependencies]
 alloy-primitives.workspace = true
