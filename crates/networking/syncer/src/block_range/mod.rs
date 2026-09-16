@@ -109,6 +109,10 @@ fn finalized_target_reached(selection: &TargetSelection, next_start_slot: u64) -
     )
 }
 
+fn should_reconsider_finalized(finalized_phase_settled: bool, block_count: u64) -> bool {
+    !finalized_phase_settled && block_count == 0
+}
+
 fn parent_lookup_budget_exhausted(
     started_at: Option<Instant>,
     requests_started: u64,
@@ -787,14 +791,19 @@ impl BlockRangeSyncer {
                         }
                     }
                 } else if let TargetSelection::NoQuorum = &selection {
-                    if finalized_phase_settled || block_cache.block_count() > 0 {
+                    if !should_reconsider_finalized(
+                        finalized_phase_settled,
+                        block_cache.block_count(),
+                    ) {
                         info!(
                             "No head-phase sync target after the finalized phase settled; ending this range."
                         );
                         break;
                     }
-                    info!("No sync target yet, waiting for peers...");
+                    info!("No head-phase sync target; reconsidering finalized sync...");
                     sleep(SLEEP_DURATION).await;
+                    phase = SyncPhase::Finalized;
+                    candidate_exhausted_since = None;
                     continue;
                 }
             }
@@ -2422,6 +2431,13 @@ mod tests {
             },
             100,
         ));
+    }
+
+    #[test]
+    fn head_no_quorum_reconsiders_an_unsettled_finalized_phase() {
+        assert!(should_reconsider_finalized(false, 0));
+        assert!(!should_reconsider_finalized(true, 0));
+        assert!(!should_reconsider_finalized(false, 1));
     }
 
     #[test]
