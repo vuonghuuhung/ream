@@ -26,7 +26,7 @@ use crate::{
             blobs_and_proofs::BLOB_FOLDER_NAME,
             block_timeliness::BlockTimelinessTable,
             checkpoint_states::CheckpointStatesTable,
-            column_sidecars::COLUMN_FOLDER_NAME,
+            column_sidecars::{SHARDED_COLUMN_FOLDER_NAME, column_directories},
             equivocating_indices::EQUIVOCATING_INDICES_FIELD,
             finalized_checkpoint::FinalizedCheckpointField,
             genesis_time::GenesisTimeField,
@@ -95,8 +95,9 @@ impl ReamDB {
             .set_cache_size(REDB_CACHE_SIZE)
             .create(data_dir.join(REDB_FILE))?;
 
-        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME] {
-            let directory = data_dir.join(folder);
+        for directory in
+            std::iter::once(data_dir.join(BLOB_FOLDER_NAME)).chain(column_directories(&data_dir))
+        {
             if directory.exists() {
                 crate::tables::sidecar_file::cleanup_temporary_sidecars(&directory)?;
             }
@@ -140,7 +141,10 @@ impl ReamDB {
         write_txn.commit()?;
 
         fs::create_dir_all(self.data_dir.join(BLOB_FOLDER_NAME))?;
-        fs::create_dir_all(self.data_dir.join(COLUMN_FOLDER_NAME))?;
+        for directory in column_directories(&self.data_dir) {
+            fs::create_dir_all(directory)?;
+        }
+        fs::File::open(self.data_dir.join(SHARDED_COLUMN_FOLDER_NAME))?.sync_all()?;
         fs::create_dir_all(self.data_dir.join(STATE_FOLDER_NAME))?;
         fs::File::open(&self.data_dir)?.sync_all()?;
         self.remove_unrecorded_state_files()?;

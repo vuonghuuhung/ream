@@ -120,8 +120,16 @@ pub(crate) fn remove_published_batch(paths: &[PathBuf]) -> Result<usize, StoreEr
             .unwrap_or_else(|err| err.into_inner())
             .remove(path);
     }
-    if let Some(path) = paths.first() {
-        File::open(path.parent().expect("sidecar parent"))?.sync_all()?;
+    let directories = paths
+        .iter()
+        .map(|path| path.parent().expect("sidecar parent"))
+        .collect::<HashSet<_>>();
+    for directory in directories {
+        match File::open(directory) {
+            Ok(file) => file.sync_all()?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(removed)
 }

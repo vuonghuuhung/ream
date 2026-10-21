@@ -2,7 +2,7 @@
 use std::{collections::HashSet, fs, path::PathBuf};
 
 use alloy_primitives::B256;
-use ream_consensus_beacon::data_column_sidecar::NUMBER_OF_COLUMNS;
+use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, NUMBER_OF_COLUMNS};
 use redb::{Durability, ReadableDatabase, ReadableTable};
 
 use super::beacon::BeaconDB;
@@ -14,7 +14,7 @@ use crate::{
                 COLUMN_MAINTENANCE, COLUMN_ROOTS_BY_SLOT, COLUMN_WRITER, INDEX_VERSION,
                 PRUNED_BEFORE,
             },
-            column_sidecars::COLUMN_FOLDER_NAME,
+            column_sidecars::column_directories,
         },
         table::REDBTable,
     },
@@ -35,26 +35,28 @@ impl BeaconDB {
             return Ok(());
         }
         let mut roots = HashSet::new();
-        for entry in fs::read_dir(self.data_dir.join(COLUMN_FOLDER_NAME))? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some((root, index)) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".ssz_snappy"))
-                .and_then(|name| name.rsplit_once('_'))
-            else {
-                continue;
-            };
-            let root = root
-                .parse::<B256>()
-                .map_err(|err| std::io::Error::other(format!("Invalid column file root: {err}")))?;
-            let index = index.parse::<u64>().map_err(|err| {
-                std::io::Error::other(format!("Invalid column file index: {err}"))
-            })?;
-            if index >= NUMBER_OF_COLUMNS {
-                return Err(std::io::Error::other("Column file index out of bounds").into());
+        for directory in column_directories(&self.data_dir) {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some((root, index)) = name
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".ssz_snappy"))
+                    .and_then(|name| name.rsplit_once('_'))
+                else {
+                    continue;
+                };
+                let root = root.parse::<B256>().map_err(|err| {
+                    std::io::Error::other(format!("Invalid column file root: {err}"))
+                })?;
+                let index = index.parse::<u64>().map_err(|err| {
+                    std::io::Error::other(format!("Invalid column file index: {err}"))
+                })?;
+                if index >= NUMBER_OF_COLUMNS {
+                    return Err(std::io::Error::other("Column file index out of bounds").into());
+                }
+                roots.insert(root);
             }
-            roots.insert(root);
         }
         for root in roots {
             match self.block_provider().get(root)? {
@@ -81,12 +83,9 @@ impl BeaconDB {
     }
 
     fn column_paths(&self, root: B256) -> Vec<PathBuf> {
+        let table = self.column_sidecars_provider();
         (0..NUMBER_OF_COLUMNS)
-            .map(|index| {
-                self.data_dir
-                    .join(COLUMN_FOLDER_NAME)
-                    .join(format!("{root}_{index}.ssz_snappy"))
-            })
+            .flat_map(|index| table.file_paths(&ColumnIdentifier::new(root, index)))
             .collect()
     }
 
@@ -281,5 +280,28 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+    #[test]
+    fn pruning_removes_legacy_and_sharded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ReamDB::new(dir.path().to_path_buf())
+            .unwrap()
+            .init_beacon_db()
+            .unwrap();
+        let table = db.column_sidecars_provider();
+        for slot in [9, 10] {
+            let (root, _, sidecar) = column(slot);
+            table.insert_batch(vec![sidecar]).unwrap();
+            if slot == 9 {
+                let [current, legacy] = table.file_paths(&ColumnIdentifier::new(root, 0));
+                fs::rename(current, legacy).unwrap();
+            }
+        }
+        assert_eq!(db.prune_columns(11, 11, 256).unwrap(), 2);
+        for slot in [9, 10] {
+            let key = ColumnIdentifier::new(column(slot).0, 0);
+            assert!(table.get(key).unwrap().is_none());
+            assert!(table.file_paths(&key).iter().all(|path| !path.exists()));
+        }
     }
 }

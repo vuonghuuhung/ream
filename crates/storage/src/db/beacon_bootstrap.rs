@@ -20,7 +20,7 @@ use crate::{
             },
             beacon_state::STATE_FOLDER_NAME,
             blobs_and_proofs::BLOB_FOLDER_NAME,
-            column_sidecars::COLUMN_FOLDER_NAME,
+            column_sidecars::column_directories,
             latest_messages::LatestMessagesTable,
         },
         table::REDBTable,
@@ -328,8 +328,11 @@ impl BeaconDB {
                 "Conflicting bootstrap markers; refusing recovery"
             );
         }
-        for folder in [BLOB_FOLDER_NAME, COLUMN_FOLDER_NAME, STATE_FOLDER_NAME] {
-            let dir = self.data_dir.join(folder);
+        for dir in [BLOB_FOLDER_NAME, STATE_FOLDER_NAME]
+            .into_iter()
+            .map(|folder| self.data_dir.join(folder))
+            .chain(column_directories(&self.data_dir))
+        {
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
                 ensure!(
@@ -420,7 +423,10 @@ mod tests {
         write.commit().unwrap();
         beacon.begin_bootstrap().unwrap();
         fs::write(
-            beacon.data_dir.join(COLUMN_FOLDER_NAME).join("partial"),
+            beacon
+                .data_dir
+                .join(crate::tables::beacon::column_sidecars::COLUMN_FOLDER_NAME)
+                .join("partial"),
             [1],
         )
         .unwrap();
@@ -446,9 +452,13 @@ mod tests {
             2
         );
         assert_eq!(
-            fs::read_dir(beacon.data_dir.join(COLUMN_FOLDER_NAME))
-                .unwrap()
-                .count(),
+            fs::read_dir(
+                beacon
+                    .data_dir
+                    .join(crate::tables::beacon::column_sidecars::COLUMN_FOLDER_NAME)
+            )
+            .unwrap()
+            .count(),
             0
         );
         assert_eq!(beacon.canonical_root_before(u64::MAX).unwrap(), None);

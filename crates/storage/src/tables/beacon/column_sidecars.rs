@@ -1,4 +1,8 @@
-use std::{io::Read, path::PathBuf, sync::Arc};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ream_consensus_beacon::data_column_sidecar::{ColumnIdentifier, DataColumnSidecar};
 use redb::{Database, Durability, ReadableTable};
@@ -12,6 +16,15 @@ use super::column_roots_by_slot::{
 use crate::{errors::StoreError, tables::table::CustomTable};
 
 pub(crate) const COLUMN_FOLDER_NAME: &str = "beacon_columns";
+pub(crate) const SHARDED_COLUMN_FOLDER_NAME: &str = "beacon_columns_v2";
+
+pub(crate) fn column_directories(data_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    std::iter::once(data_dir.join(COLUMN_FOLDER_NAME)).chain((0..256).map(|shard| {
+        data_dir
+            .join(SHARDED_COLUMN_FOLDER_NAME)
+            .join(format!("{shard:02x}"))
+    }))
+}
 
 pub struct ColumnSidecarsTable {
     pub data_dir: PathBuf,
@@ -76,11 +89,19 @@ impl ColumnSidecarsTable {
         Ok(())
     }
 
-    fn column_file_path(&self, column_identifier: &ColumnIdentifier) -> PathBuf {
-        self.data_dir.join(COLUMN_FOLDER_NAME).join(format!(
-            "{}_{}.ssz_snappy",
-            column_identifier.block_root, column_identifier.index
-        ))
+    pub(crate) fn file_paths(&self, key: &ColumnIdentifier) -> [PathBuf; 2] {
+        let name = format!("{}_{}.ssz_snappy", key.block_root, key.index);
+        [
+            self.data_dir
+                .join(SHARDED_COLUMN_FOLDER_NAME)
+                .join(format!("{:02x}", key.block_root[0]))
+                .join(&name),
+            self.data_dir.join(COLUMN_FOLDER_NAME).join(name),
+        ]
+    }
+
+    fn column_file_path(&self, key: &ColumnIdentifier) -> PathBuf {
+        self.file_paths(key)[0].clone()
     }
 }
 
@@ -89,9 +110,12 @@ impl CustomTable for ColumnSidecarsTable {
     type Value = DataColumnSidecar;
 
     fn get(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
-        let file_path = self.column_file_path(&key);
-
-        let Some(mut file) = crate::tables::sidecar_file::open_published(&file_path)? else {
+        let [current, legacy] = self.file_paths(&key);
+        let file = match crate::tables::sidecar_file::open_published(&current)? {
+            Some(file) => Some(file),
+            None => crate::tables::sidecar_file::open_published(&legacy)?,
+        };
+        let Some(mut file) = file else {
             return Ok(None);
         };
         let mut bytes = vec![];
@@ -110,9 +134,11 @@ impl CustomTable for ColumnSidecarsTable {
     }
 
     fn remove(&self, key: Self::Key) -> Result<Option<Self::Value>, StoreError> {
-        crate::tables::sidecar_file::remove_published(&self.column_file_path(&key), || {
-            self.get(key)
-        })
+        let _writer = COLUMN_WRITER.lock().unwrap_or_else(|err| err.into_inner());
+        let [current, legacy] = self.file_paths(&key);
+        let value = crate::tables::sidecar_file::remove_published(&current, || self.get(key))?;
+        crate::tables::sidecar_file::remove_published(&legacy, || Ok(()))?;
+        Ok(value)
     }
 }
 
@@ -144,6 +170,75 @@ mod tests {
 
         assert_eq!(result, None);
 
+        Ok(())
+    }
+    #[test]
+    fn sharded_columns_read_legacy_files_and_remove_both_copies() -> Result<(), StoreError> {
+        use ream_consensus_beacon::data_column_sidecar::DataColumnSidecar;
+        use snap::raw::Encoder;
+        use ssz::Encode;
+        use tree_hash::TreeHash;
+
+        let dir = TempDir::new("legacy_column_shards")?;
+        let db = crate::db::ReamDB::new(dir.path().to_path_buf())?.init_beacon_db()?;
+        let table = db.column_sidecars_provider();
+        let value = DataColumnSidecar {
+            index: 0,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            kzg_commitments_inclusion_proof: Default::default(),
+        };
+        let key = ColumnIdentifier::new(
+            value.signed_block_header.message.tree_hash_root(),
+            value.index,
+        );
+        let [current, legacy] = table.file_paths(&key);
+        fs::write(&legacy, Encoder::new().compress_vec(&value.as_ssz_bytes())?)?;
+        assert_eq!(table.get(key)?, Some(value.clone()));
+        table.insert(key, value.clone())?;
+        assert!(current.exists());
+        assert!(legacy.exists());
+        fs::write(&legacy, b"damaged legacy duplicate")?;
+        assert_eq!(table.get(key)?, Some(value.clone()));
+        assert_eq!(table.remove(key)?, Some(value));
+        assert!(!current.exists());
+        assert!(!legacy.exists());
+        assert_eq!(table.get(key)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_cleans_staging_in_shards_and_retains_published_columns() -> Result<(), StoreError> {
+        use ream_consensus_beacon::data_column_sidecar::DataColumnSidecar;
+        use tree_hash::TreeHash;
+
+        let dir = TempDir::new("column_shard_restart")?;
+        let value = DataColumnSidecar {
+            index: 0,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            kzg_commitments_inclusion_proof: Default::default(),
+        };
+        let key = ColumnIdentifier::new(
+            value.signed_block_header.message.tree_hash_root(),
+            value.index,
+        );
+        let staging;
+        {
+            let db = crate::db::ReamDB::new(dir.path().to_path_buf())?.init_beacon_db()?;
+            let table = db.column_sidecars_provider();
+            table.insert(key, value.clone())?;
+            let current = table.file_paths(&key)[0].clone();
+            staging = current.parent().unwrap().join(".ream-sidecar-orphan");
+            fs::write(&staging, b"interrupted")?;
+        }
+        let db = crate::db::ReamDB::new(dir.path().to_path_buf())?.init_beacon_db()?;
+        assert!(!staging.exists());
+        assert_eq!(db.column_sidecars_provider().get(key)?, Some(value));
         Ok(())
     }
 }
