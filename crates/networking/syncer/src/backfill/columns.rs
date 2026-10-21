@@ -46,7 +46,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 use tree_hash::TreeHash;
 
-use super::{BAN_DURATION, ColumnCustody, PendingBytesReset, scheduler::BackfillConfig};
+use super::{BAN_DURATION, ColumnCustody, scheduler::BackfillConfig};
 
 /// Sidecars per batch, as Prysm: four blocks for a supernode, more for smaller custody.
 const MAX_BATCH_SIDECARS: usize = 128 * 4;
@@ -188,9 +188,11 @@ fn process(
         if cancelled() {
             break;
         }
+        let started = Instant::now();
         let verify_timer = BEACON_BACKFILL_VERIFY_SECONDS.start_timer();
         let invalid = invalid_supplier(&responses);
         drop(verify_timer);
+        let verified = started.elapsed();
         if invalid.is_some() {
             return Ok((committed, invalid));
         }
@@ -203,7 +205,17 @@ fn process(
             .collect::<Vec<_>>();
         let count = columns.len();
         db.column_sidecars_provider().insert_batch(columns)?;
-        match commit_coverage(db, batch.from, batch.to)? {
+        let inserted = started.elapsed();
+        let coverage = commit_coverage(db, batch.from, batch.to)?;
+        debug!(
+            from = batch.from,
+            columns = count,
+            verify_ms = verified.as_millis() as u64,
+            insert_ms = (inserted - verified).as_millis() as u64,
+            commit_ms = (started.elapsed() - inserted).as_millis() as u64,
+            "Column batch processed"
+        );
+        match coverage {
             Some(meta) => {
                 BEACON_BACKFILL_COLUMNS_COMMITTED_TOTAL.inc_by(count as u64);
                 committed = Some(meta);
@@ -233,14 +245,31 @@ pub(super) struct ColumnBackfill {
     pub custody: ColumnCustody,
 }
 
+/// A step's batches being verified and committed while the next step downloads.
+struct InFlight {
+    worker: Worker,
+    /// The frontier once all of them commit; the next step plans below it.
+    frontier: u64,
+    bytes: usize,
+}
+
+fn set_pending_bytes(bytes: usize) {
+    BEACON_BACKFILL_PENDING_BYTES
+        .with_label_values(&["columns"])
+        .set(bytes as i64);
+}
+
 impl ColumnBackfill {
     pub async fn run(self, mut running: watch::Receiver<bool>) {
         let mut banned = HashMap::new();
         let mut requests = HashMap::<PeerId, u64>::new();
         let mut last_log = Instant::now();
-        let mut worker = None;
+        let mut in_flight = None;
         loop {
             if !*running.borrow_and_update() {
+                // A paused worker stops at its next check; its payloads go before new ones.
+                let _ = self.finish(&mut in_flight, &mut banned).await;
+                set_pending_bytes(0);
                 if running.changed().await.is_err() {
                     return;
                 }
@@ -255,20 +284,18 @@ impl ColumnBackfill {
                         )
                 })
             {
+                let _ = self.finish(&mut in_flight, &mut banned).await;
+                set_pending_bytes(0);
                 ream_metrics::BEACON_CUSTODY_GROUPS_BACKFILLED.set(self.custody.group_count as i64);
                 info!(frontier_slot = ?meta.sidecars.frontier, "Column backfill complete");
                 return;
-            }
-            // A paused step's worker stops at its next check; its payloads go before new ones.
-            if let Some(handle) = worker.take() {
-                let _ = handle.await;
             }
             // Dropping the batch future drops every callback and aborts its download tasks.
             let active = running.clone();
             let result = tokio::select! {
                 biased;
                 changed = running.changed() => { if changed.is_err() { return; } continue; },
-                result = self.step(&active, &mut banned, &mut requests, &mut worker) => result,
+                result = self.step(&active, &mut banned, &mut requests, &mut in_flight) => result,
             };
             match result {
                 Ok(Some(meta)) => {
@@ -277,6 +304,7 @@ impl ColumnBackfill {
                         last_log = Instant::now();
                     }
                 }
+                Ok(None) if in_flight.is_some() => {}
                 Ok(None) => sleep(Duration::from_secs(1)).await,
                 Err(err) => {
                     warn!(%err, "Column backfill waiting to retry");
@@ -286,43 +314,56 @@ impl ColumnBackfill {
         }
     }
 
-    /// Downloads up to `MAX_QUEUED_BATCHES` batches at any time in the slot, then verifies and
-    /// commits every complete one in order inside the backfill window.
+    /// Downloads up to `MAX_QUEUED_BATCHES` batches below those a worker is still committing,
+    /// then hands them to a new worker that verifies and commits them in order inside the
+    /// backfill window. Returns the coverage the previous worker committed.
     async fn step(
         &self,
         running: &watch::Receiver<bool>,
         banned: &mut HashMap<PeerId, Instant>,
         requests: &mut HashMap<PeerId, u64>,
-        worker: &mut Option<Worker>,
+        in_flight: &mut Option<InFlight>,
     ) -> anyhow::Result<Option<BackfillMeta>> {
-        let meta = match self.db.cached_backfill_mode()? {
+        let mut meta = match self.db.cached_backfill_mode()? {
             BackfillMode::Checkpoint(meta) => meta,
-            _ => return Ok(None),
+            _ => return self.finish(in_flight, banned).await,
         };
+        let mut budget = self.config.max_pending_bytes;
+        let mut held = 0;
+        if let Some(flight) = in_flight.as_ref() {
+            meta.sidecars.frontier = Some(flight.frontier);
+            held = flight.bytes;
+            budget = budget.saturating_sub(held);
+        }
         let epoch = get_current_slot_from_db(&self.db)?
             / ream_consensus_misc::constants::beacon::SLOTS_PER_EPOCH;
         let da_start = beacon_network_spec().data_column_retention_start_slot(epoch);
         let db = self.db.clone();
-        let budget = self.config.max_pending_bytes;
         let column_count = self.custody.columns.len();
-        let batches = tokio::task::spawn_blocking(move || {
+        let planned = tokio::task::spawn_blocking(move || {
             plan_batches(&db, &meta, da_start, budget, column_count)
         })
-        .await??;
-        let Some(first) = batches.first() else {
-            return Ok(None);
+        .await?;
+        let batches = match planned {
+            Ok(batches) => batches,
+            // The budget the worker holds comes back once it finishes.
+            Err(_) if in_flight.is_some() => Vec::new(),
+            Err(err) => return Err(err),
         };
-        BEACON_BACKFILL_SIDECAR_FRONTIER_SLOT.set(first.to as i64);
-        let _pending_reset = PendingBytesReset("columns");
-        BEACON_BACKFILL_PENDING_BYTES
-            .with_label_values(&["columns"])
-            .set(batches.iter().map(|batch| batch.max_bytes).sum::<usize>() as i64);
+        if batches.is_empty() {
+            let committed = self.finish(in_flight, banned).await;
+            set_pending_bytes(0);
+            return committed;
+        }
+        set_pending_bytes(held + batches.iter().map(|batch| batch.max_bytes).sum::<usize>());
         banned.retain(|_, at| at.elapsed() < BAN_DURATION);
         let planned = batches.len();
         let started = Instant::now();
         let load = Mutex::new(Load::default());
-        // One request budget for every batch of the step.
-        let permits = Arc::new(Semaphore::new(self.config.max_inflight));
+        // Column requests are small, so each batch of the step gets `max_inflight` of them.
+        let permits = Arc::new(Semaphore::new(
+            self.config.max_inflight.saturating_mul(MAX_QUEUED_BATCHES),
+        ));
         let mut assigned = Vec::new();
         for batch in batches {
             match self.assign(&batch, banned, requests, &load) {
@@ -357,23 +398,54 @@ impl ColumnBackfill {
             download_ms = started.elapsed().as_millis() as u64,
             "Column backfill downloads"
         );
-        if downloaded.is_empty() {
-            return Ok(None);
+        // The previous batches commit first; these only extend what they committed.
+        let expected = in_flight.as_ref().map(|flight| flight.frontier);
+        let committed = self.finish(in_flight, banned).await?;
+        if expected.is_some()
+            && committed.as_ref().and_then(|meta| meta.sidecars.frontier) != expected
+        {
+            set_pending_bytes(0);
+            return Ok(committed);
         }
+        let bytes = downloaded
+            .iter()
+            .map(|(batch, _)| batch.max_bytes)
+            .sum::<usize>();
+        set_pending_bytes(bytes);
+        let Some(frontier) = downloaded.last().map(|(batch, _)| batch.from) else {
+            set_pending_bytes(0);
+            return Ok(committed);
+        };
         if self.rate_limit {
             super::wait_for_backfill_window(&self.db, running).await?;
         }
         if !*running.borrow() || running.has_changed().is_err() {
-            return Ok(None);
+            set_pending_bytes(0);
+            return Ok(committed);
         }
         let db = self.db.clone();
         let running = running.clone();
-        // Kept by `run` when this step is dropped, so the next step waits for it.
-        let handle = worker.insert(tokio::task::spawn_blocking(move || {
-            process(&db, downloaded, &running)
-        }));
-        let (meta, invalid) = handle.await??;
-        *worker = None;
+        *in_flight = Some(InFlight {
+            worker: tokio::task::spawn_blocking(move || process(&db, downloaded, &running)),
+            frontier,
+            bytes,
+        });
+        Ok(committed)
+    }
+
+    /// Waits for the batches a worker is committing; returns the coverage it committed.
+    async fn finish(
+        &self,
+        in_flight: &mut Option<InFlight>,
+        banned: &mut HashMap<PeerId, Instant>,
+    ) -> anyhow::Result<Option<BackfillMeta>> {
+        let Some(flight) = in_flight.as_mut() else {
+            return Ok(None);
+        };
+        // Kept in `in_flight` until it ends, so a dropped step leaves it to the next one.
+        let result = (&mut flight.worker).await;
+        *in_flight = None;
+        let (meta, invalid) = result??;
         if let Some(peer) = invalid {
             warn!(?peer, "Invalid historical column proof");
             banned.insert(peer, Instant::now());
@@ -934,17 +1006,18 @@ mod tests {
         }
     }
 
+    /// One step, then the commit of what it downloaded.
     async fn run_step(driver: &ColumnBackfill) -> Option<BackfillMeta> {
         let (_sender, running) = watch::channel(true);
-        driver
-            .step(
-                &running,
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut None,
-            )
+        let (mut banned, mut in_flight) = (HashMap::new(), None);
+        let committed = driver
+            .step(&running, &mut banned, &mut HashMap::new(), &mut in_flight)
             .await
-            .unwrap()
+            .unwrap();
+        if in_flight.is_none() {
+            return committed;
+        }
+        driver.finish(&mut in_flight, &mut banned).await.unwrap()
     }
 
     #[tokio::test]
@@ -1518,5 +1591,123 @@ mod tests {
         assert_eq!(batches[0].to, fixture.meta.sidecars.frontier.unwrap());
         assert_eq!(batches[1].to, batches[0].from);
         assert_eq!(batches[1].from, base);
+    }
+
+    type Ranges = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// Serves every requested column of a range and records the ranges asked for.
+    fn serve_ranges(
+        columns: Vec<DataColumnSidecar>,
+    ) -> (
+        mpsc::UnboundedSender<P2PMessage>,
+        Ranges,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let seen = ranges.clone();
+        let server = tokio::spawn(async move {
+            while let Some(P2PMessage::Request(P2PRequest::DataColumnRange {
+                start,
+                count,
+                columns: indices,
+                callback,
+                ..
+            })) = receiver.recv().await
+            {
+                seen.lock().unwrap().push((start, count));
+                for column in columns.iter().filter(|column| {
+                    (start..start + count).contains(&column.signed_block_header.message.slot)
+                        && indices.contains(&column.index)
+                }) {
+                    let response = BeaconResponseMessage::DataColumnSidecarsByRange(column.clone());
+                    let _ = callback
+                        .send(Ok(P2PCallbackResponse::ResponseMessage(Arc::new(response))))
+                        .await;
+                }
+                let _ = callback.send(Ok(P2PCallbackResponse::EndOfStream)).await;
+            }
+        });
+        (sender, ranges, server)
+    }
+
+    #[tokio::test]
+    async fn the_next_step_downloads_below_batches_still_committing() {
+        let fixture = fixture();
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let (sender, ranges, server) = serve_ranges(fixture.columns.clone());
+        let block_bytes = (2048 + 48 + 48 + 512) * 128;
+        let driver = |max_pending_bytes| ColumnBackfill {
+            db: fixture.db.clone(),
+            sender: sender.clone(),
+            network: fixture.network.clone(),
+            config: BackfillConfig {
+                max_pending_bytes,
+                ..BackfillConfig::default()
+            },
+            rate_limit: false,
+            custody: ColumnCustody::all(),
+        };
+        let (_running_sender, running) = watch::channel(true);
+        let (mut banned, mut requests, mut in_flight) = (HashMap::new(), HashMap::new(), None);
+        // The budget fits only the block at base + 3; a worker commits it.
+        driver(block_bytes)
+            .step(&running, &mut banned, &mut requests, &mut in_flight)
+            .await
+            .unwrap();
+        assert_eq!(
+            in_flight.as_ref().map(|flight| flight.frontier),
+            Some(base + 2)
+        );
+        // The next step plans below it within what the worker leaves of the budget.
+        let next = driver(2 * block_bytes);
+        let committed = next
+            .step(&running, &mut banned, &mut requests, &mut in_flight)
+            .await
+            .unwrap();
+        assert_eq!(committed.unwrap().sidecars.frontier, Some(base + 2));
+        let committed = next.finish(&mut in_flight, &mut banned).await.unwrap();
+        assert_eq!(committed.unwrap().sidecars.frontier, Some(base));
+        assert_eq!(*ranges.lock().unwrap(), vec![(base + 2, 2), (base, 2)]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn downloads_below_an_uncommitted_worker_are_dropped() {
+        let fixture = fixture();
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let (sender, _ranges, server) = serve_ranges(fixture.columns.clone());
+        let driver = ColumnBackfill {
+            db: fixture.db.clone(),
+            sender,
+            network: fixture.network.clone(),
+            config: BackfillConfig::default(),
+            rate_limit: false,
+            custody: ColumnCustody::all(),
+        };
+        let (_running_sender, running) = watch::channel(true);
+        let mut banned = HashMap::new();
+        // A worker that committed nothing, as after a pause.
+        let mut in_flight = Some(InFlight {
+            worker: tokio::spawn(async { Ok((None, None)) }),
+            frontier: base + 2,
+            bytes: 0,
+        });
+        let committed = driver
+            .step(&running, &mut banned, &mut HashMap::new(), &mut in_flight)
+            .await
+            .unwrap();
+        assert!(committed.is_none() && in_flight.is_none());
+        assert_eq!(current(&fixture.db), fixture.meta);
+        let column = &fixture.columns[0];
+        let key = ream_consensus_beacon::data_column_sidecar::ColumnIdentifier::new(
+            column.signed_block_header.message.tree_hash_root(),
+            column.index,
+        );
+        assert_eq!(
+            fixture.db.column_sidecars_provider().get(key).unwrap(),
+            None
+        );
+        server.abort();
     }
 }
