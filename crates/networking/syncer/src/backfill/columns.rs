@@ -265,6 +265,40 @@ pub(super) struct ColumnBackfill {
     pub custody: ColumnCustody,
 }
 
+/// What earlier steps learned about peers: the requests sent, so work spreads, and recent range
+/// response times, so each step asks the fastest custody peers first.
+#[derive(Default)]
+struct PeerStats {
+    requests: HashMap<PeerId, u64>,
+    response_ms: Mutex<HashMap<PeerId, u64>>,
+}
+
+impl PeerStats {
+    /// Unknown peers count as fast, so each one gets tried.
+    fn response_ms(&self, peer: &PeerId) -> u64 {
+        self.response_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn record(&self, peer: PeerId, elapsed: Duration, answered: bool) {
+        // A failed request counts as slow even when it fails fast.
+        let mut sample = elapsed.as_millis() as u64;
+        if !answered {
+            sample = sample.max(10_000);
+        }
+        let mut times = self
+            .response_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let estimate = times.entry(peer).or_insert(sample);
+        *estimate = (*estimate * 2 + sample) / 3;
+    }
+}
+
 /// A step's batches being verified and committed while the next step downloads.
 struct InFlight {
     worker: Worker,
@@ -282,7 +316,7 @@ fn set_pending_bytes(bytes: usize) {
 impl ColumnBackfill {
     pub async fn run(self, mut running: watch::Receiver<bool>) {
         let mut banned = HashMap::new();
-        let mut requests = HashMap::<PeerId, u64>::new();
+        let mut stats = PeerStats::default();
         let mut last_log = Instant::now();
         let mut in_flight = None;
         loop {
@@ -315,7 +349,7 @@ impl ColumnBackfill {
             let result = tokio::select! {
                 biased;
                 changed = running.changed() => { if changed.is_err() { return; } continue; },
-                result = self.step(&active, &mut banned, &mut requests, &mut in_flight) => result,
+                result = self.step(&active, &mut banned, &mut stats, &mut in_flight) => result,
             };
             match result {
                 Ok(Some(meta)) => {
@@ -341,7 +375,7 @@ impl ColumnBackfill {
         &self,
         running: &watch::Receiver<bool>,
         banned: &mut HashMap<PeerId, Instant>,
-        requests: &mut HashMap<PeerId, u64>,
+        stats: &mut PeerStats,
         in_flight: &mut Option<InFlight>,
     ) -> anyhow::Result<Option<BackfillMeta>> {
         let mut meta = match self.db.cached_backfill_mode()? {
@@ -386,13 +420,14 @@ impl ColumnBackfill {
         ));
         let mut assigned = Vec::new();
         for batch in batches {
-            match self.assign(&batch, banned, requests, &load) {
+            match self.assign(&batch, banned, stats, &load) {
                 Some((peers, groups)) => assigned.push((batch, peers, groups)),
                 None => break,
             }
         }
+        let stats = &*stats;
         let fetched = futures::future::join_all(assigned.iter().map(|(batch, peers, groups)| {
-            self.fetch(batch, peers, groups.clone(), banned, &load, &permits)
+            self.fetch(batch, peers, groups.clone(), banned, &load, &permits, stats)
         }))
         .await;
         let mut downloaded = Vec::new();
@@ -481,7 +516,7 @@ impl ColumnBackfill {
         &self,
         batch: &Batch,
         banned: &HashMap<PeerId, Instant>,
-        requests: &mut HashMap<PeerId, u64>,
+        stats: &mut PeerStats,
         load: &Mutex<Load>,
     ) -> Option<(Vec<CachedPeer>, Groups)> {
         let mut groups = Groups::new();
@@ -514,14 +549,19 @@ impl ColumnBackfill {
                         groups.len() >= self.config.max_inflight
                             && !groups.contains_key(&peer.peer_id),
                         groups.get(&peer.peer_id).map_or(0, Vec::len),
-                        requests.get(&peer.peer_id).copied().unwrap_or_default(),
+                        stats.response_ms(&peer.peer_id),
+                        stats
+                            .requests
+                            .get(&peer.peer_id)
+                            .copied()
+                            .unwrap_or_default(),
                     )
                 })?;
             groups.entry(peer.peer_id).or_default().push(index);
         }
         for peer in groups.keys() {
             load.range.insert(*peer);
-            let count = requests.entry(*peer).or_default();
+            let count = stats.requests.entry(*peer).or_default();
             *count = count.saturating_add(1);
         }
         Some((peers, groups))
@@ -530,6 +570,7 @@ impl ColumnBackfill {
     /// Returns every custody column of the batch's blob blocks, or `None` when some stay
     /// missing, with the peers that sent invalid or incomplete responses. Missing columns are
     /// requested by root from other custody peers, a bounded number of times.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch(
         &self,
         batch: &Batch,
@@ -538,6 +579,7 @@ impl ColumnBackfill {
         banned: &HashMap<PeerId, Instant>,
         load: &Mutex<Load>,
         permits: &Arc<Semaphore>,
+        stats: &PeerStats,
     ) -> anyhow::Result<(Option<Responses>, Vec<(PeerId, String)>)> {
         let mut responses = Responses::new();
         let mut faults = Vec::<(PeerId, String)>::new();
@@ -596,13 +638,20 @@ impl ColumnBackfill {
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "Column response"
                     );
-                    (peer, columns, roots, attempt, response)
+                    (peer, columns, roots, attempt, response, started.elapsed())
                 });
             }
             let Some(response) = tasks.join_next().await else {
                 break;
             };
-            let (peer, columns, roots, attempt, response) = response?;
+            let (peer, columns, roots, attempt, response, elapsed) = response?;
+            if roots.is_none() {
+                stats.record(
+                    peer,
+                    elapsed,
+                    matches!(response, ColumnResponse::Columns(_)),
+                );
+            }
             {
                 let mut load = lock(load);
                 match roots {
@@ -1029,7 +1078,12 @@ mod tests {
         let (_sender, running) = watch::channel(true);
         let (mut banned, mut in_flight) = (HashMap::new(), None);
         let committed = driver
-            .step(&running, &mut banned, &mut HashMap::new(), &mut in_flight)
+            .step(
+                &running,
+                &mut banned,
+                &mut PeerStats::default(),
+                &mut in_flight,
+            )
             .await
             .unwrap();
         if in_flight.is_none() {
@@ -1121,7 +1175,7 @@ mod tests {
         let mut banned = HashMap::new();
         assert!(
             driver
-                .step(&running, &mut banned, &mut HashMap::new(), &mut None)
+                .step(&running, &mut banned, &mut PeerStats::default(), &mut None)
                 .await
                 .unwrap()
                 .is_none()
@@ -1427,6 +1481,7 @@ mod tests {
         let load = Mutex::new(Load::default());
         let permits = Arc::new(Semaphore::new(1));
         let banned = HashMap::new();
+        let stats = PeerStats::default();
         let (a, b) = tokio::join!(
             driver.fetch(
                 &upper,
@@ -1434,7 +1489,8 @@ mod tests {
                 Groups::from([(first, vec![0, 1])]),
                 &banned,
                 &load,
-                &permits
+                &permits,
+                &stats
             ),
             driver.fetch(
                 &lower,
@@ -1442,7 +1498,8 @@ mod tests {
                 Groups::from([(second, vec![0, 1])]),
                 &banned,
                 &load,
-                &permits
+                &permits,
+                &stats
             ),
         );
         assert!(a.unwrap().0.is_some() && b.unwrap().0.is_some());
@@ -1553,6 +1610,7 @@ mod tests {
                 &HashMap::new(),
                 &Mutex::new(Load::default()),
                 &Arc::new(Semaphore::new(5)),
+                &PeerStats::default(),
             )
             .await
             .unwrap();
@@ -1667,10 +1725,10 @@ mod tests {
             custody: ColumnCustody::all(),
         };
         let (_running_sender, running) = watch::channel(true);
-        let (mut banned, mut requests, mut in_flight) = (HashMap::new(), HashMap::new(), None);
+        let (mut banned, mut stats, mut in_flight) = (HashMap::new(), PeerStats::default(), None);
         // The budget fits only the block at base + 3; a worker commits it.
         driver(block_bytes)
-            .step(&running, &mut banned, &mut requests, &mut in_flight)
+            .step(&running, &mut banned, &mut stats, &mut in_flight)
             .await
             .unwrap();
         assert_eq!(
@@ -1680,7 +1738,7 @@ mod tests {
         // The next step plans below it within what the worker leaves of the budget.
         let next = driver(2 * block_bytes);
         let committed = next
-            .step(&running, &mut banned, &mut requests, &mut in_flight)
+            .step(&running, &mut banned, &mut stats, &mut in_flight)
             .await
             .unwrap();
         assert_eq!(committed.unwrap().sidecars.frontier, Some(base + 2));
@@ -1712,7 +1770,12 @@ mod tests {
             bytes: 0,
         });
         let committed = driver
-            .step(&running, &mut banned, &mut HashMap::new(), &mut in_flight)
+            .step(
+                &running,
+                &mut banned,
+                &mut PeerStats::default(),
+                &mut in_flight,
+            )
             .await
             .unwrap();
         assert!(committed.is_none() && in_flight.is_none());
@@ -1727,5 +1790,41 @@ mod tests {
             None
         );
         server.abort();
+    }
+
+    #[test]
+    fn columns_go_to_the_fastest_custody_peer() {
+        let fixture = fixture();
+        let slow = fixture.network.connected_peers()[0].peer_id;
+        let fast = add_supernode(&fixture.network);
+        let driver = ColumnBackfill {
+            db: fixture.db.clone(),
+            sender: mpsc::unbounded_channel().0,
+            network: fixture.network.clone(),
+            config: BackfillConfig {
+                max_inflight: 1,
+                ..BackfillConfig::default()
+            },
+            rate_limit: false,
+            custody: ColumnCustody::all(),
+        };
+        let base = fixture.meta.blocks.frontier.oldest_block_slot;
+        let batch = plan_batch(&fixture.db, &fixture.meta, base, 128 * 1024 * 1024, 128)
+            .unwrap()
+            .unwrap();
+        let mut stats = PeerStats::default();
+        stats.record(slow, Duration::from_secs(5), true);
+        stats.record(fast, Duration::from_millis(200), true);
+        let chosen = |stats: &mut PeerStats| {
+            let (_, groups) = driver
+                .assign(&batch, &HashMap::new(), stats, &Mutex::new(Load::default()))
+                .unwrap();
+            groups.keys().copied().collect::<Vec<_>>()
+        };
+        assert_eq!(chosen(&mut stats), vec![fast]);
+        // Failed requests count as slow even when they fail fast.
+        stats.record(fast, Duration::from_millis(100), false);
+        stats.record(fast, Duration::from_millis(100), false);
+        assert_eq!(chosen(&mut stats), vec![slow]);
     }
 }
