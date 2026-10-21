@@ -12,6 +12,10 @@ use libp2p::PeerId;
 use ream_consensus_beacon::{
     data_column_sidecar::DataColumnSidecar, electra::beacon_block::SignedBeaconBlock,
 };
+use ream_consensus_misc::{
+    beacon_block_header::SignedBeaconBlockHeader,
+    polynomial_commitments::kzg_commitment::KZGCommitment,
+};
 use ream_fork_choice_beacon::store::get_current_slot_from_db;
 use ream_metrics::{
     BEACON_BACKFILL_COLUMNS_COMMITTED_TOTAL, BEACON_BACKFILL_PEER_BANS_TOTAL,
@@ -55,8 +59,24 @@ const MAX_BATCH_SLOTS: u64 = 32;
 struct Batch {
     from: u64,
     to: u64,
-    blocks: BTreeMap<B256, SignedBeaconBlock>,
+    blocks: BTreeMap<B256, ColumnTarget>,
     max_bytes: usize,
+}
+
+/// What a block's columns must match. Taken once per block: the header hashes the whole body.
+#[derive(Clone)]
+struct ColumnTarget {
+    header: SignedBeaconBlockHeader,
+    commitments: Vec<KZGCommitment>,
+}
+
+impl ColumnTarget {
+    fn new(block: &SignedBeaconBlock) -> Self {
+        Self {
+            header: block.signed_header(),
+            commitments: block.message.body.blob_kzg_commitments.to_vec(),
+        }
+    }
 }
 
 /// Slots without a block or without commitments are crossed only by walking authenticated
@@ -121,7 +141,7 @@ fn plan_batch(
         from = slot;
         let parent = block.message.parent_root;
         if commitments > 0 {
-            blocks.insert(root, block);
+            blocks.insert(root, ColumnTarget::new(&block));
         }
         if from == floor || to - from >= MAX_BATCH_SLOTS {
             break;
@@ -550,10 +570,8 @@ impl ColumnBackfill {
                             let Some(block) = batch.blocks.get(root) else {
                                 continue;
                             };
-                            limit += (block.message.body.blob_kzg_commitments.len()
-                                * (2048 + 48 + 48)
-                                + 512)
-                                * missing.len();
+                            limit +=
+                                (block.commitments.len() * (2048 + 48 + 48) + 512) * missing.len();
                             blocks.insert(*root, block.clone());
                         }
                         (Want::Roots(roots.clone()), blocks, limit)
@@ -756,7 +774,7 @@ async fn receive_columns(
     peer: PeerId,
     range: std::ops::Range<u64>,
     want: Want,
-    blocks: Arc<BTreeMap<B256, SignedBeaconBlock>>,
+    blocks: Arc<BTreeMap<B256, ColumnTarget>>,
     limit: usize,
 ) -> ColumnResponse {
     let (callback, mut receiver) = mpsc::channel(1);
@@ -809,8 +827,8 @@ async fn receive_columns(
                         return ColumnResponse::Fault("unrequested or duplicate column".into());
                     }
                     if !column.verify()
-                        || column.kzg_commitments != block.message.body.blob_kzg_commitments
-                        || column.signed_block_header != block.signed_header()
+                        || column.kzg_commitments[..] != block.commitments[..]
+                        || column.signed_block_header != block.header
                     {
                         return ColumnResponse::Fault(
                             "column does not match verified block".into(),
@@ -1399,7 +1417,7 @@ mod tests {
             Batch {
                 from,
                 to: from + 2,
-                blocks: BTreeMap::from([(root, block)]),
+                blocks: BTreeMap::from([(root, ColumnTarget::new(&block))]),
                 max_bytes: (2048 + 48 + 48 + 512) * 2,
             }
         };
