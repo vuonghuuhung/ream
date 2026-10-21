@@ -7200,6 +7200,7 @@ dependencies = [
  "libp2p-identity",
  "libp2p-mplex",
  "parking_lot",
+ "rayon",
  "ream-bls",
  "ream-chain-beacon",
  "ream-consensus-beacon",

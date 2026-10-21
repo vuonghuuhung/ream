@@ -9,6 +9,7 @@ use std::{
 use alloy_primitives::B256;
 use anyhow::{anyhow, ensure};
 use libp2p::PeerId;
+use rayon::prelude::*;
 use ream_consensus_beacon::{
     data_column_sidecar::DataColumnSidecar, electra::beacon_block::SignedBeaconBlock,
 };
@@ -195,8 +196,25 @@ type Responses = Vec<(PeerId, Vec<DataColumnSidecar>)>;
 /// Verifies and commits downloaded batches; returns the committed coverage and a faulty peer.
 type Worker = tokio::task::JoinHandle<anyhow::Result<(Option<BackfillMeta>, Option<PeerId>)>>;
 
-/// Verifies and commits complete batches in order. Any pause or resume since the step started
-/// cancels it, before verification and again before anything is published.
+/// Proofs are checked on threads of their own, half the cores at most, so live work keeps the
+/// rest.
+fn verify_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((cores / 2).clamp(1, 4))
+            .thread_name(|index| format!("column-backfill-verify-{index}"))
+            .build()
+            .expect("column backfill verify pool should build")
+    })
+}
+
+/// Verifies all batches together, then commits them in order up to the first invalid one. Any
+/// pause or resume since the step started cancels it, before verification and again before
+/// anything is published.
 fn process(
     db: &BeaconDB,
     downloaded: Vec<(Batch, Responses)>,
@@ -204,21 +222,29 @@ fn process(
 ) -> anyhow::Result<(Option<BackfillMeta>, Option<PeerId>)> {
     let cancelled = || !*running.borrow() || running.has_changed().unwrap_or(true);
     let mut committed = None;
-    for (batch, responses) in downloaded {
-        if cancelled() {
-            break;
-        }
-        let started = Instant::now();
-        let verify_timer = BEACON_BACKFILL_VERIFY_SECONDS.start_timer();
-        let invalid = invalid_supplier(&responses);
-        drop(verify_timer);
-        let verified = started.elapsed();
+    if cancelled() {
+        return Ok((committed, None));
+    }
+    let checks = verify_pool().install(|| {
+        downloaded
+            .par_iter()
+            .map(|(_, responses)| {
+                let started = Instant::now();
+                let invalid = invalid_supplier(responses);
+                let elapsed = started.elapsed();
+                BEACON_BACKFILL_VERIFY_SECONDS.observe(elapsed.as_secs_f64());
+                (invalid, elapsed)
+            })
+            .collect::<Vec<_>>()
+    });
+    for ((batch, responses), (invalid, verified)) in downloaded.into_iter().zip(checks) {
         if invalid.is_some() {
             return Ok((committed, invalid));
         }
         if cancelled() {
             break;
         }
+        let started = Instant::now();
         let columns = responses
             .into_iter()
             .flat_map(|(_, columns)| columns)
@@ -231,7 +257,7 @@ fn process(
             from = batch.from,
             columns = count,
             verify_ms = verified.as_millis() as u64,
-            insert_ms = (inserted - verified).as_millis() as u64,
+            insert_ms = inserted.as_millis() as u64,
             commit_ms = (started.elapsed() - inserted).as_millis() as u64,
             "Column batch processed"
         );
@@ -249,11 +275,13 @@ fn process(
 /// Returns the first peer whose columns fail the proofs. Headers and commitments were matched
 /// against stored blocks on receipt.
 fn invalid_supplier(responses: &Responses) -> Option<PeerId> {
-    responses.iter().find_map(|(peer, columns)| {
-        let valid = columns.iter().all(|column| column.verify_inclusion_proof())
-            && verify_data_column_sidecars_kzg_proofs(columns).unwrap_or(false);
-        (!valid).then_some(*peer)
-    })
+    responses
+        .par_iter()
+        .position_first(|(_, columns)| {
+            !(columns.iter().all(|column| column.verify_inclusion_proof())
+                && verify_data_column_sidecars_kzg_proofs(columns).unwrap_or(false))
+        })
+        .map(|position| responses[position].0)
 }
 
 pub(super) struct ColumnBackfill {

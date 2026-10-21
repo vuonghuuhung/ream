@@ -22,6 +22,7 @@ futures.workspace = true
 libp2p.workspace = true
 libp2p-identity.workspace = true
 libp2p-mplex.workspace = true
+rayon.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
