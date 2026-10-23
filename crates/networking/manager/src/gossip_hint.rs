@@ -165,8 +165,8 @@ impl UnknownParentColumns {
     }
 }
 
-/// Blocks whose columns were already asked of the execution client, so a block that came by
-/// gossip is not asked again when it becomes pending.
+/// Blocks that passed gossip validation or whose columns were asked of the execution client, so
+/// a block is not asked twice and a block still being imported is not looked up.
 #[derive(Default)]
 pub struct ExecutionFetchReservations {
     recent: Mutex<VecDeque<B256>>,
@@ -185,6 +185,13 @@ impl ExecutionFetchReservations {
         }
         recent.push_back(block_root);
         true
+    }
+
+    pub fn contains(&self, block_root: &B256) -> bool {
+        self.recent
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .contains(block_root)
     }
 }
 
@@ -263,6 +270,7 @@ mod tests {
         let reservations = ExecutionFetchReservations::default();
         assert!(reservations.reserve(B256::repeat_byte(1)));
         assert!(!reservations.reserve(B256::repeat_byte(1)));
+        assert!(reservations.contains(&B256::repeat_byte(1)));
         assert!(reservations.reserve(B256::repeat_byte(2)));
     }
 }

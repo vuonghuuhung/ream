@@ -550,6 +550,7 @@ async fn start_unseen_block_lookup(
     lookup_refusals: &BlocksByRootRefusals,
     unknown_parent_lookups: &mut UnknownParentLookupCoordinator<SignedBeaconBlock, PeerId>,
     block_lookup_coordinator: &BlockLookupCoordinator,
+    gossip_blocks: &ExecutionFetchReservations,
 ) {
     let UnseenBlock {
         block_root,
@@ -572,7 +573,9 @@ async fn start_unseen_block_lookup(
     {
         return count("stale");
     }
-    let known = unknown_parent_lookups.contains(&block_root)
+    // A gossip block that validated may still be importing.
+    let known = gossip_blocks.contains(&block_root)
+        || unknown_parent_lookups.contains(&block_root)
         || block_lookup_coordinator.contains_entry(&block_root)
         || beacon_chain
             .db()
@@ -1015,9 +1018,10 @@ impl NetworkManagerService {
             let p2p_sender = p2p_sender.clone();
             let execution_fetches = execution_fetches.clone();
             Arc::new(move |block| {
-                if fetch_execution_blobs
+                let first = execution_fetches.reserve(block.message.tree_hash_root());
+                if first
+                    && fetch_execution_blobs
                     && !block.message.body.blob_kzg_commitments.is_empty()
-                    && execution_fetches.reserve(block.message.tree_hash_root())
                 {
                     inc_int_counter_vec(&BEACON_EXECUTION_COLUMN_FETCHES_TOTAL, &["gossip"]);
                     spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
@@ -1531,6 +1535,7 @@ impl NetworkManagerService {
                         &lookup_refusals,
                         &mut unknown_parent_lookups,
                         &block_lookup_coordinator,
+                        &execution_fetches,
                     )
                     .await;
                 }
@@ -1575,7 +1580,7 @@ impl NetworkManagerService {
                                 &mut hints,
                                 propagation_source,
                                 |block| {
-                                    if fetch_execution_blobs && execution_fetches.reserve(block.message.tree_hash_root()) {
+                                    if execution_fetches.reserve(block.message.tree_hash_root()) && fetch_execution_blobs {
                                         spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
                                     }
                                 },
