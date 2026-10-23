@@ -6,9 +6,13 @@ use libp2p::{
 };
 use ream_chain_beacon::beacon_chain::BeaconChain;
 use ream_consensus_beacon::{
-    data_column_sidecar::NUMBER_OF_COLUMNS, electra::beacon_block::SignedBeaconBlock,
+    data_column_sidecar::{DataColumnSidecar, NUMBER_OF_COLUMNS},
+    electra::beacon_block::SignedBeaconBlock,
 };
-use ream_metrics::BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL;
+use ream_metrics::{
+    BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL, BEACON_UNKNOWN_PARENT_COLUMNS_TOTAL,
+    inc_int_counter_vec,
+};
 use ream_p2p::gossipsub::beacon::topics::{GossipTopic, GossipTopicKind};
 use ream_storage::cache::BeaconCacheDB;
 use tokio::{
@@ -17,8 +21,11 @@ use tokio::{
 };
 use tracing::{debug, error};
 
-use super::handle::{UnknownParentGossipBlock, handle_gossipsub_message};
-use crate::{block_lookup::PendingGossipItem, p2p_sender::P2PSender};
+use super::handle::{UnknownParentGossipBlock, handle_data_column, handle_gossipsub_message};
+use crate::{
+    block_lookup::PendingGossipItem, gossip_hint::GossipHint, p2p_sender::P2PSender,
+    timing::ColumnSource,
+};
 
 /// Messages waiting for a worker. A full queue sheds new messages as IGNORE, which does not
 /// penalize their senders; mainnet sends thousands of attestations per slot.
@@ -114,11 +121,21 @@ pub fn is_handled_concurrently(topic: &TopicHash) -> bool {
     }
 }
 
-struct GossipWork {
-    message: Message,
-    message_id: MessageId,
-    propagation_source: PeerId,
+enum GossipWork {
+    Message {
+        message: Message,
+        message_id: MessageId,
+        propagation_source: PeerId,
+    },
+    /// A column kept since before its parent block came, checked again now that it has.
+    ReplayColumn {
+        column: Box<DataColumnSidecar>,
+        propagation_source: PeerId,
+    },
 }
+
+/// Lookup hints waiting for the manager loop. Hints are best effort, so a full queue drops them.
+pub const HINT_QUEUE_CAPACITY: usize = 4 * NUMBER_OF_COLUMNS as usize;
 
 /// Tasks that validate and import gossip messages off the manager loop. Handled one at a time,
 /// attestation BLS checks alone fell minutes behind the network on mainnet.
@@ -138,6 +155,7 @@ impl GossipWorkers {
         cached_db: Arc<BeaconCacheDB>,
         p2p_sender: P2PSender,
         pending_items: mpsc::Sender<PendingGossipItem>,
+        hints: mpsc::Sender<GossipHint>,
         budget: &GossipWorkerBudget,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<GossipWork>(GOSSIP_QUEUE_CAPACITY);
@@ -148,6 +166,7 @@ impl GossipWorkers {
             let cached_db = cached_db.clone();
             let p2p_sender = worker_p2p_sender.clone();
             let pending_items = pending_items.clone();
+            let hints = hints.clone();
             let permits = permits.clone();
             async move {
                 let _permit = permits
@@ -155,30 +174,62 @@ impl GossipWorkers {
                     .await
                     .expect("the gossip worker budget is never closed");
                 let mut pending_item = None;
-                let mut unknown_parent_block = None;
-                let acceptance = handle_gossipsub_message(
-                    work.message,
-                    &beacon_chain,
-                    &cached_db,
-                    &mut pending_item,
-                    &mut unknown_parent_block,
-                    work.propagation_source,
-                    |_| {},
-                )
-                .await;
-                // Only blocks produce unknown-parent work, and they never come here.
-                debug_assert!(unknown_parent_block.is_none());
+                let mut found_hints = Vec::new();
+                match work {
+                    GossipWork::Message {
+                        message,
+                        message_id,
+                        propagation_source,
+                    } => {
+                        let mut unknown_parent_block = None;
+                        let acceptance = handle_gossipsub_message(
+                            message,
+                            &beacon_chain,
+                            &cached_db,
+                            &mut pending_item,
+                            &mut unknown_parent_block,
+                            &mut found_hints,
+                            propagation_source,
+                            |_| {},
+                        )
+                        .await;
+                        // Only blocks produce unknown-parent work, and they never come here.
+                        debug_assert!(unknown_parent_block.is_none());
+                        p2p_sender.report_gossip_validation(
+                            message_id,
+                            propagation_source,
+                            acceptance,
+                        );
+                    }
+                    GossipWork::ReplayColumn {
+                        column,
+                        propagation_source,
+                    } => {
+                        let subnet_id = column.compute_subnet();
+                        handle_data_column(
+                            column,
+                            subnet_id,
+                            &beacon_chain,
+                            &cached_db,
+                            &mut pending_item,
+                            &mut found_hints,
+                            propagation_source,
+                            ColumnSource::Replayed,
+                        )
+                        .await;
+                    }
+                }
                 if let Some(item) = pending_item
                     && !try_forward(&pending_items, item)
                 {
                     debug!("Pending gossip item queue is full, dropping a column");
                     BEACON_GOSSIP_PENDING_ITEMS_DROPPED_TOTAL.inc();
                 }
-                p2p_sender.report_gossip_validation(
-                    work.message_id,
-                    work.propagation_source,
-                    acceptance,
-                );
+                for hint in found_hints {
+                    if !try_forward(&hints, hint) {
+                        debug!("Gossip hint queue is full, dropping a hint");
+                    }
+                }
             }
         });
         Self {
@@ -211,28 +262,37 @@ impl GossipWorkers {
             let unknown_parents = unknown_parents.clone();
             let on_valid_block = on_valid_block.clone();
             async move {
+                let GossipWork::Message {
+                    message,
+                    message_id,
+                    propagation_source,
+                } = work
+                else {
+                    debug_assert!(false, "columns are never replayed on the block workers");
+                    return;
+                };
                 let mut pending_item = None;
                 let mut unknown_parent_block = None;
+                let mut found_hints = Vec::new();
                 let acceptance = handle_gossipsub_message(
-                    work.message,
+                    message,
                     &beacon_chain,
                     &cached_db,
                     &mut pending_item,
                     &mut unknown_parent_block,
-                    work.propagation_source,
+                    &mut found_hints,
+                    propagation_source,
                     |block| on_valid_block(block),
                 )
                 .await;
-                p2p_sender.report_gossip_validation(
-                    work.message_id,
-                    work.propagation_source,
-                    acceptance,
-                );
+                // Blocks and blob sidecars give no hints.
+                debug_assert!(found_hints.is_empty());
+                p2p_sender.report_gossip_validation(message_id, propagation_source, acceptance);
                 if let Some(block) = unknown_parent_block
                     && unknown_parents
                         .send(UnknownParentWork {
                             block,
-                            propagation_source: work.propagation_source,
+                            propagation_source,
                         })
                         .await
                         .is_err()
@@ -261,30 +321,38 @@ impl GossipWorkers {
 
     /// Queues `message` for a worker, or reports it as IGNORE when the queue is full.
     pub fn submit(&self, message: Message, message_id: MessageId, propagation_source: PeerId) {
-        let work = GossipWork {
+        let work = GossipWork::Message {
             message,
-            message_id,
+            message_id: message_id.clone(),
             propagation_source,
         };
         if let Err(err) = self.sender.try_send(work) {
-            let work = match err {
-                mpsc::error::TrySendError::Full(work) => {
-                    debug!("Gossip queue is full, ignoring message {}", work.message_id);
-                    work
+            match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    debug!("Gossip queue is full, ignoring message {message_id}");
                 }
-                mpsc::error::TrySendError::Closed(work) => {
-                    error!(
-                        "No gossip worker is running, ignoring message {}",
-                        work.message_id
-                    );
-                    work
+                mpsc::error::TrySendError::Closed(_) => {
+                    error!("No gossip worker is running, ignoring message {message_id}");
                 }
-            };
+            }
             self.p2p_sender.report_gossip_validation(
-                work.message_id,
-                work.propagation_source,
+                message_id,
+                propagation_source,
                 MessageAcceptance::Ignore,
             );
+        }
+    }
+
+    /// Queues `column`, kept since before its parent block came, to be checked again.
+    pub fn replay_column(&self, column: DataColumnSidecar, propagation_source: PeerId) {
+        let work = GossipWork::ReplayColumn {
+            column: Box::new(column),
+            propagation_source,
+        };
+        if self.sender.try_send(work).is_err() {
+            inc_int_counter_vec(&BEACON_UNKNOWN_PARENT_COLUMNS_TOTAL, &["dropped"]);
+        } else {
+            inc_int_counter_vec(&BEACON_UNKNOWN_PARENT_COLUMNS_TOTAL, &["replayed"]);
         }
     }
 }

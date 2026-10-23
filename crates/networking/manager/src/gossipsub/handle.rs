@@ -6,6 +6,7 @@ pub use libp2p::gossipsub::{Message, MessageAcceptance};
 use ream_chain_beacon::beacon_chain::{BeaconChain, BlockProcessingOutcome};
 use ream_consensus_beacon::{
     blob_sidecar::BlobIdentifier,
+    data_column_sidecar::DataColumnSidecar,
     electra::{beacon_block::SignedBeaconBlock, beacon_state::BeaconState},
     single_attestation::SingleAttestation,
     sync_committee::SyncCommittee,
@@ -24,7 +25,10 @@ use ream_p2p::gossipsub::beacon::{
 };
 use ream_storage::{
     cache::BeaconCacheDB,
-    tables::{field::REDBField, table::CustomTable},
+    tables::{
+        field::REDBField,
+        table::{CustomTable, REDBTable},
+    },
 };
 use ream_validator_beacon::{
     attestation::single_attestation_to_attestation,
@@ -37,10 +41,13 @@ use tree_hash::TreeHash;
 
 use crate::{
     block_lookup::{PendingGossipItem, import_validated_data_column},
+    gossip_hint::{GossipHint, UnseenBlock, UnseenBlockSource, reserve_hint},
     gossipsub::validate::{
         aggregate_and_proof::validate_aggregate_and_proof,
         attester_slashing::validate_attester_slashing,
-        beacon_attestation::validate_beacon_attestation,
+        beacon_attestation::{
+            UNSEEN_BLOCK_REASON, attestation_signature_is_valid, validate_beacon_attestation,
+        },
         beacon_block::validate_gossip_beacon_block,
         blob_sidecar::validate_blob_sidecar,
         bls_to_execution_change::validate_bls_to_execution_change,
@@ -251,15 +258,150 @@ fn dependency_message_acceptance(
     }
 }
 
+/// Validates and imports `data_column_sidecar`, from gossip or kept since it came before its
+/// parent block. A column whose parent is unknown is handed back in `hints` to keep.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_data_column(
+    data_column_sidecar: Box<DataColumnSidecar>,
+    subnet_id: u64,
+    beacon_chain: &BeaconChain,
+    cached_db: &BeaconCacheDB,
+    pending_item: &mut Option<PendingGossipItem>,
+    hints: &mut Vec<GossipHint>,
+    propagation_source: PeerId,
+    source: ColumnSource,
+) -> MessageAcceptance {
+    let current_time_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        Err(err) => {
+            error!("Failed to get current time for data column validation: {err}");
+            return MessageAcceptance::Ignore;
+        }
+    };
+
+    let validation_result = match validate_data_column_sidecar_full(
+        &data_column_sidecar,
+        beacon_chain,
+        current_time_ms,
+        subnet_id,
+        cached_db,
+    )
+    .await
+    {
+        Ok(validation_result) => validation_result,
+        Err(err) => {
+            error!("Could not validate data_column_sidecar: {err}");
+            return MessageAcceptance::Ignore;
+        }
+    };
+
+    let acceptance = dependency_message_acceptance(&validation_result);
+    let slot = data_column_sidecar.signed_block_header.message.slot;
+    match validation_result {
+        DependencyValidationResult::Accept => {
+            let block_root = data_column_sidecar
+                .signed_block_header
+                .message
+                .tree_hash_root();
+            if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+                log_columns_received(
+                    genesis_time,
+                    slot,
+                    [data_column_sidecar.index],
+                    source,
+                    Some(&propagation_source),
+                );
+            }
+            if let Err(err) = import_validated_data_column(beacon_chain, *data_column_sidecar).await
+            {
+                error!("Failed to import data_column_sidecar: {err}");
+            }
+            let block_seen = beacon_chain
+                .db()
+                .block_provider()
+                .contains_key(block_root)
+                .unwrap_or(true);
+            if !block_seen && reserve_hint(cached_db, block_root).await {
+                hints.push(GossipHint::UnseenBlock(UnseenBlock {
+                    block_root,
+                    slot,
+                    source: UnseenBlockSource::Column,
+                    peer: propagation_source,
+                }));
+            }
+        }
+        DependencyValidationResult::Reject(reason) => {
+            info!("Data column sidecar rejected: {reason}");
+        }
+        DependencyValidationResult::Ignore(reason) => {
+            debug!("Data column sidecar ignored: {reason}");
+        }
+        DependencyValidationResult::UnknownParent { parent_root } => {
+            debug!("Data column sidecar's parent block not seen, keeping it");
+            if reserve_hint(cached_db, parent_root).await {
+                hints.push(GossipHint::UnseenBlock(UnseenBlock {
+                    block_root: parent_root,
+                    slot,
+                    source: UnseenBlockSource::ChildColumn,
+                    peer: propagation_source,
+                }));
+            }
+            hints.push(GossipHint::UnknownParentColumn {
+                column: data_column_sidecar,
+                peer: propagation_source,
+            });
+        }
+        DependencyValidationResult::ParentPendingAvailability {
+            parent_root: _,
+            validated,
+        } => {
+            *pending_item = Some(PendingGossipItem::Column { column: validated });
+        }
+    }
+    acceptance
+}
+
+/// A lookup hint for the block `attestation` votes for, which has not been seen. Only for
+/// attestations of the last two slots, and only once its signature checks out, since an
+/// attestation for an unknown block is otherwise not verified.
+async fn attestation_unseen_block_hint(
+    beacon_chain: &BeaconChain,
+    cached_db: &BeaconCacheDB,
+    attestation: &SingleAttestation,
+    propagation_source: PeerId,
+) -> Option<GossipHint> {
+    let block_root = attestation.data.beacon_block_root;
+    let head = beacon_chain.head().ok()?;
+    if attestation.data.slot + 1 < head.current_slot
+        || cached_db
+            .hinted_block_roots
+            .read()
+            .await
+            .contains(&block_root)
+        || !attestation_signature_is_valid(&head.state, attestation).unwrap_or(false)
+        || !reserve_hint(cached_db, block_root).await
+    {
+        return None;
+    }
+    Some(GossipHint::UnseenBlock(UnseenBlock {
+        block_root,
+        slot: attestation.data.slot,
+        source: UnseenBlockSource::Attestation,
+        peer: propagation_source,
+    }))
+}
+
 /// Dispatches a gossipsub message to its appropriate handler. `on_valid_block` gets each block
 /// that passed gossip validation, before its import starts. The result is counted by topic kind:
 /// gossipsub scores peers down for every REJECT, so the count shows how often that happens.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    hints: &mut Vec<GossipHint>,
     propagation_source: PeerId,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
@@ -272,6 +414,7 @@ pub async fn handle_gossipsub_message(
         cached_db,
         pending_item,
         unknown_parent_block,
+        hints,
         propagation_source,
         on_valid_block,
     )
@@ -285,12 +428,14 @@ pub async fn handle_gossipsub_message(
     acceptance
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_gossipsub_message(
     message: Message,
     beacon_chain: &BeaconChain,
     cached_db: &BeaconCacheDB,
     pending_item: &mut Option<PendingGossipItem>,
     unknown_parent_block: &mut Option<UnknownParentGossipBlock>,
+    hints: &mut Vec<GossipHint>,
     propagation_source: PeerId,
     on_valid_block: impl FnOnce(&SignedBeaconBlock),
 ) -> MessageAcceptance {
@@ -399,6 +544,17 @@ async fn dispatch_gossipsub_message(
                     }
                     ValidationResult::Ignore(reason) => {
                         debug!("Attestation ignored: {reason}");
+                        if reason == UNSEEN_BLOCK_REASON
+                            && let Some(hint) = attestation_unseen_block_hint(
+                                beacon_chain,
+                                cached_db,
+                                &single_attestation,
+                                propagation_source,
+                            )
+                            .await
+                        {
+                            hints.push(hint);
+                        }
                     }
                 }
                 acceptance
@@ -689,65 +845,17 @@ async fn dispatch_gossipsub_message(
                     }
                 };
 
-                let current_time_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                    Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    Err(err) => {
-                        error!("Failed to get current time for data column validation: {err}");
-                        return MessageAcceptance::Ignore;
-                    }
-                };
-
-                let validation_result = match validate_data_column_sidecar_full(
-                    &data_column_sidecar,
-                    beacon_chain,
-                    current_time_ms,
+                handle_data_column(
+                    data_column_sidecar,
                     subnet_id,
+                    beacon_chain,
                     cached_db,
+                    pending_item,
+                    hints,
+                    propagation_source,
+                    ColumnSource::Gossip,
                 )
                 .await
-                {
-                    Ok(validation_result) => validation_result,
-                    Err(err) => {
-                        error!("Could not validate data_column_sidecar: {err}");
-                        return MessageAcceptance::Ignore;
-                    }
-                };
-
-                let acceptance = dependency_message_acceptance(&validation_result);
-                match validation_result {
-                    DependencyValidationResult::Accept => {
-                        if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
-                            log_columns_received(
-                                genesis_time,
-                                data_column_sidecar.signed_block_header.message.slot,
-                                [data_column_sidecar.index],
-                                ColumnSource::Gossip,
-                                Some(&propagation_source),
-                            );
-                        }
-                        if let Err(err) =
-                            import_validated_data_column(beacon_chain, *data_column_sidecar).await
-                        {
-                            error!("Failed to import data_column_sidecar: {err}");
-                        }
-                    }
-                    DependencyValidationResult::Reject(reason) => {
-                        info!("Data column sidecar rejected: {reason}");
-                    }
-                    DependencyValidationResult::Ignore(reason) => {
-                        debug!("Data column sidecar ignored: {reason}");
-                    }
-                    DependencyValidationResult::UnknownParent { .. } => {
-                        unreachable!("data column validation cannot return unknown-parent")
-                    }
-                    DependencyValidationResult::ParentPendingAvailability {
-                        parent_root: _,
-                        validated,
-                    } => {
-                        *pending_item = Some(PendingGossipItem::Column { column: validated });
-                    }
-                }
-                acceptance
             }
             GossipsubMessage::LightClientFinalityUpdate(light_client_finality_update) => {
                 debug!(
@@ -974,6 +1082,7 @@ mod tests {
             &cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            &mut Vec::new(),
             PeerId::random(),
             |_| {},
         )

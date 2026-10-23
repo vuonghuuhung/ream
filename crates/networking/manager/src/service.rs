@@ -22,7 +22,8 @@ use ream_fork_choice_beacon::data_availability::AvailabilityEntryStatus;
 use ream_metrics::{
     BEACON_BLOCK_LOOKUP_ENTRIES, BEACON_BLOCK_LOOKUP_EVENTS_TOTAL, BEACON_CUSTODY_GROUPS,
     BEACON_DATA_COLUMN_FETCH_ATTEMPTS_TOTAL, BEACON_DATA_COLUMN_FETCH_DURATION_SECONDS,
-    BEACON_DATA_COLUMN_FETCH_ENTRIES, inc_int_counter_vec, inc_int_counter_vec_by,
+    BEACON_DATA_COLUMN_FETCH_ENTRIES, BEACON_EXECUTION_COLUMN_FETCHES_TOTAL,
+    BEACON_UNSEEN_BLOCK_LOOKUPS_TOTAL, inc_int_counter_vec, inc_int_counter_vec_by,
     observe_histogram, set_int_gauge_vec,
 };
 use ream_network_spec::networks::beacon_network_spec;
@@ -63,19 +64,20 @@ use crate::{
     data_availability_fetch::{
         ColumnFetchOutcome, ColumnFetchTracker, fetch_missing_columns, pending_anchor_for_recovery,
     },
+    gossip_hint::{ExecutionFetchReservations, GossipHint, UnknownParentColumns, UnseenBlock},
     gossipsub::{
         cross_seed::publish_reconstructed_columns,
         handle::{
             UnknownParentGossipBlock, handle_gossipsub_message, init_gossipsub_config_with_topics,
         },
         workers::{
-            GossipWorkerBudget, GossipWorkers, OnValidBlock, PENDING_ITEM_QUEUE_CAPACITY,
-            is_data_column, is_gossip_block, is_handled_concurrently,
+            GossipWorkerBudget, GossipWorkers, HINT_QUEUE_CAPACITY, OnValidBlock,
+            PENDING_ITEM_QUEUE_CAPACITY, is_data_column, is_gossip_block, is_handled_concurrently,
         },
     },
     p2p_sender::P2PSender,
     req_resp::handle_req_resp_message,
-    timing::{ColumnSource, log_columns_received},
+    timing::{ColumnSource, log_columns_received, log_unseen_block_lookup},
     unknown_parent_lookup::{
         BlocksByRootRefusals, UnknownParentLookupUpdate, apply_unknown_parent_update,
         fallback_lookup_peer, spawn_unknown_parent_action,
@@ -489,6 +491,132 @@ fn spawn_execution_column_fetch(
     });
 }
 
+/// Fetches the columns of `block_root` from the execution client's blobs once it is pending
+/// availability. Blocks that came by gossip are fetched on validation; this covers those imported
+/// through a lookup, whose columns gossip may have dropped before their parent came.
+fn spawn_pending_execution_column_fetch(
+    beacon_chain: &Arc<BeaconChain>,
+    cached_db: &Arc<BeaconCacheDB>,
+    p2p_sender: &P2PSender,
+    reservations: &ExecutionFetchReservations,
+    block_root: B256,
+) {
+    if !reservations.reserve(block_root) {
+        return;
+    }
+    let beacon_chain = beacon_chain.clone();
+    let cached_db = cached_db.clone();
+    let p2p_sender = p2p_sender.clone();
+    tokio::spawn(async move {
+        let block = {
+            let store = beacon_chain.store.lock().await;
+            store
+                .data_availability_checker
+                .pending_block(&block_root)
+                .map(|pending| pending.signed_block.clone())
+        };
+        let Some(block) = block else {
+            return;
+        };
+        // The execution client only keeps the blobs of recent blocks.
+        let current_slot = beacon_chain.head().map_or(0, |head| head.current_slot);
+        if block.message.slot + SLOTS_PER_EPOCH < current_slot {
+            return;
+        }
+        inc_int_counter_vec(&BEACON_EXECUTION_COLUMN_FETCHES_TOTAL, &["pending"]);
+        spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, &block);
+    });
+}
+
+/// Wait before looking up a block that gossip referred to, so a block that is still coming or
+/// being imported is not downloaded again.
+const UNSEEN_BLOCK_LOOKUP_DELAY: Duration = Duration::from_secs(1);
+/// Blocks referred to longer ago than this many slots are left to range sync.
+const UNSEEN_BLOCK_LOOKUP_SLOTS: u64 = 4;
+
+fn schedule_unseen_block_lookup(unseen: UnseenBlock, due: &mpsc::UnboundedSender<UnseenBlock>) {
+    let due = due.clone();
+    tokio::spawn(async move {
+        sleep(UNSEEN_BLOCK_LOOKUP_DELAY).await;
+        let _ = due.send(unseen);
+    });
+}
+
+/// Looks up `unseen` by root unless it came or is already being looked up meanwhile.
+async fn start_unseen_block_lookup(
+    unseen: UnseenBlock,
+    beacon_chain: &BeaconChain,
+    network_state: &NetworkState,
+    lookup_refusals: &BlocksByRootRefusals,
+    unknown_parent_lookups: &mut UnknownParentLookupCoordinator<SignedBeaconBlock, PeerId>,
+    block_lookup_coordinator: &BlockLookupCoordinator,
+) {
+    let UnseenBlock {
+        block_root,
+        slot,
+        source,
+        peer,
+    } = unseen;
+    let count = |outcome: &str| {
+        inc_int_counter_vec(
+            &BEACON_UNSEEN_BLOCK_LOOKUPS_TOTAL,
+            &[source.as_str(), outcome],
+        );
+    };
+    let Ok(head) = beacon_chain.head() else {
+        return;
+    };
+    // While syncing, recent gossip names blocks that range sync is about to download.
+    if slot + UNSEEN_BLOCK_LOOKUP_SLOTS < head.current_slot
+        || head.head_slot + SLOTS_PER_EPOCH < head.current_slot
+    {
+        return count("stale");
+    }
+    let known = unknown_parent_lookups.contains(&block_root)
+        || block_lookup_coordinator.contains_entry(&block_root)
+        || beacon_chain
+            .db()
+            .block_provider()
+            .contains_key(block_root)
+            .unwrap_or(true)
+        || beacon_chain
+            .store
+            .lock()
+            .await
+            .data_availability_checker
+            .pending_block(&block_root)
+            .is_some();
+    if known {
+        return count("known");
+    }
+    let lookup_peer = if lookup_refusals.contains(&peer) {
+        fallback_lookup_peer(network_state, lookup_refusals, &[peer], block_root).unwrap_or(peer)
+    } else {
+        peer
+    };
+    match unknown_parent_lookups.insert_block_root(block_root, lookup_peer) {
+        ream_syncer::unknown_parent_lookups::InsertOutcome::Inserted => {
+            count("started");
+            if let Ok(genesis_time) = beacon_chain.db().genesis_time_provider().get() {
+                log_unseen_block_lookup(genesis_time, slot, block_root, source.as_str());
+            }
+        }
+        ream_syncer::unknown_parent_lookups::InsertOutcome::Duplicate => count("known"),
+        ream_syncer::unknown_parent_lookups::InsertOutcome::Rejected(_) => count("rejected"),
+    }
+}
+
+/// Hands the columns that waited for `parent_root` back to the column workers.
+fn replay_unknown_parent_columns(
+    unknown_parent_columns: &mut UnknownParentColumns,
+    column_workers: &GossipWorkers,
+    parent_root: B256,
+) {
+    for (column, peer) in unknown_parent_columns.take(parent_root) {
+        column_workers.replay_column(column, peer);
+    }
+}
+
 /// Margin after a slot start before the slot tick runs. The tick reads the wall clock in whole
 /// seconds, so it must not run before the slot's first second has begun.
 const SLOT_TICK_DELAY: Duration = Duration::from_millis(20);
@@ -859,12 +987,17 @@ impl NetworkManagerService {
             mpsc::unbounded_channel::<(B256, PeerId, ColumnFetchOutcome)>();
         let (pending_item_sender, mut pending_item_receiver) =
             mpsc::channel(PENDING_ITEM_QUEUE_CAPACITY);
+        let (hint_sender, mut hint_receiver) = mpsc::channel(HINT_QUEUE_CAPACITY);
+        let (unseen_block_sender, mut unseen_block_receiver) = mpsc::unbounded_channel();
+        let mut unknown_parent_columns = UnknownParentColumns::default();
+        let execution_fetches = Arc::new(ExecutionFetchReservations::default());
         let gossip_worker_budget = GossipWorkerBudget::for_current_runtime();
         let mut gossip_workers = GossipWorkers::start(
             beacon_chain.clone(),
             cached_db.clone(),
             p2p_sender.clone(),
             pending_item_sender.clone(),
+            hint_sender.clone(),
             &gossip_worker_budget,
         );
         let mut column_workers = GossipWorkers::start(
@@ -872,6 +1005,7 @@ impl NetworkManagerService {
             cached_db.clone(),
             p2p_sender.clone(),
             pending_item_sender.clone(),
+            hint_sender.clone(),
             &gossip_worker_budget,
         );
         let (unknown_parent_sender, mut unknown_parent_receiver) = mpsc::channel(MAX_LOOKUPS);
@@ -879,8 +1013,13 @@ impl NetworkManagerService {
             let beacon_chain = beacon_chain.clone();
             let cached_db = cached_db.clone();
             let p2p_sender = p2p_sender.clone();
+            let execution_fetches = execution_fetches.clone();
             Arc::new(move |block| {
-                if fetch_execution_blobs {
+                if fetch_execution_blobs
+                    && !block.message.body.blob_kzg_commitments.is_empty()
+                    && execution_fetches.reserve(block.message.tree_hash_root())
+                {
+                    inc_int_counter_vec(&BEACON_EXECUTION_COLUMN_FETCHES_TOTAL, &["gossip"]);
                     spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
                 }
             })
@@ -934,6 +1073,10 @@ impl NetworkManagerService {
                 Some(update) = unknown_parent_update_receiver.recv() => {
                     let before = unknown_parent_lookups.len();
                     let completed = matches!(&update, UnknownParentLookupUpdate::BlockImported { .. });
+                    let failed_download = match &update {
+                        UnknownParentLookupUpdate::DownloadFailed { requested_root, .. } => Some(*requested_root),
+                        _ => None,
+                    };
                     apply_unknown_parent_update(
                         &mut unknown_parent_lookups,
                         &beacon_chain,
@@ -941,6 +1084,12 @@ impl NetworkManagerService {
                         &mut lookup_refusals,
                         update,
                     ).await;
+                    // A lookup that gave up may be hinted again by later gossip.
+                    if let Some(block_root) = failed_download
+                        && !unknown_parent_lookups.contains(&block_root)
+                    {
+                        cached_db.hinted_block_roots.write().await.pop(&block_root);
+                    }
                     record_removed_lookup_entries(
                         UNKNOWN_PARENT_LOOKUP,
                         if completed { "completed" } else { "failed" },
@@ -1026,6 +1175,7 @@ impl NetworkManagerService {
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::Imported { block_root } => {
                                     unknown_parent_lookups.block_imported(block_root);
                                     column_fetch_tracker.remove(&block_root);
+                                    replay_unknown_parent_columns(&mut unknown_parent_columns, &column_workers, block_root);
                                     if let Some(slot) = state_advance_slot
                                         && beacon_chain.head().is_ok_and(|head| head.current_slot == slot)
                                     {
@@ -1034,6 +1184,16 @@ impl NetworkManagerService {
                                 }
                                 ream_chain_beacon::beacon_chain::BlockImportEvent::PendingAvailability { block_root } => {
                                     unknown_parent_lookups.block_pending_availability(block_root);
+                                    replay_unknown_parent_columns(&mut unknown_parent_columns, &column_workers, block_root);
+                                    if fetch_execution_blobs {
+                                        spawn_pending_execution_column_fetch(
+                                            &beacon_chain,
+                                            &cached_db,
+                                            &p2p_sender,
+                                            &execution_fetches,
+                                            block_root,
+                                        );
+                                    }
                                     // Gossip will not redeliver columns for a block that is no
                                     // longer near the head, so fetch them regardless of which
                                     // ingress path left this block pending.
@@ -1079,8 +1239,10 @@ impl NetworkManagerService {
                             for block_root in reconciliation.imported_roots {
                                 block_lookup_coordinator.parent_imported(block_root);
                                 unknown_parent_lookups.block_imported(block_root);
+                                replay_unknown_parent_columns(&mut unknown_parent_columns, &column_workers, block_root);
                             }
                             for block_root in reconciliation.pending_availability_roots {
+                                replay_unknown_parent_columns(&mut unknown_parent_columns, &column_workers, block_root);
                                 block_lookup_coordinator
                                     .mark_block_pending_availability(block_root);
                                 unknown_parent_lookups.block_pending_availability(block_root);
@@ -1291,6 +1453,7 @@ impl NetworkManagerService {
                                     &[UNKNOWN_PARENT_LOOKUP, "pruned"],
                                 );
                             }
+                            unknown_parent_columns.prune(current_slot);
                             column_fetch_tracker.retain_pending(&pending_roots);
                             for block_root in pending_roots {
                                 column_fetch_tracker.enqueue(block_root);
@@ -1348,6 +1511,29 @@ impl NetworkManagerService {
                     error!("A gossip column worker stopped: {err}");
                     return;
                 }
+                // Gossip that refers to blocks not seen yet.
+                Some(hint) = hint_receiver.recv() => {
+                    match hint {
+                        GossipHint::UnknownParentColumn { column, peer } => {
+                            let current_slot = beacon_chain.head().map_or(0, |head| head.current_slot);
+                            unknown_parent_columns.insert(*column, peer, current_slot);
+                        }
+                        GossipHint::UnseenBlock(unseen) => {
+                            schedule_unseen_block_lookup(unseen, &unseen_block_sender);
+                        }
+                    }
+                }
+                Some(unseen) = unseen_block_receiver.recv() => {
+                    start_unseen_block_lookup(
+                        unseen,
+                        &beacon_chain,
+                        &network_state,
+                        &lookup_refusals,
+                        &mut unknown_parent_lookups,
+                        &block_lookup_coordinator,
+                    )
+                    .await;
+                }
                 // Lookup work from columns that the column workers validated.
                 Some(item) = pending_item_receiver.recv() => {
                     insert_pending_gossip_item(
@@ -1379,19 +1565,24 @@ impl NetworkManagerService {
                         ReamNetworkEvent::GossipsubMessage { propagation_source, message_id, message } => {
                             let mut pending_item = None;
                             let mut unknown_parent_block = None;
+                            let mut hints = Vec::new();
                             let acceptance = handle_gossipsub_message(
                                 message,
                                 &beacon_chain,
                                 &cached_db,
                                 &mut pending_item,
                                 &mut unknown_parent_block,
+                                &mut hints,
                                 propagation_source,
                                 |block| {
-                                    if fetch_execution_blobs {
+                                    if fetch_execution_blobs && execution_fetches.reserve(block.message.tree_hash_root()) {
                                         spawn_execution_column_fetch(&beacon_chain, &cached_db, &p2p_sender, block);
                                     }
                                 },
                             ).await;
+                            for hint in hints {
+                                let _ = hint_sender.try_send(hint);
+                            }
                             p2p_sender.report_gossip_validation(
                                 message_id,
                                 propagation_source,

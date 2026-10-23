@@ -190,6 +190,27 @@ lazy_static::lazy_static! {
         default_registry()
     ).expect("failed to create BEACON_BLOCK_LOOKUP_EVENTS_TOTAL int counter vec");
 
+    pub static ref BEACON_UNKNOWN_PARENT_COLUMNS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_unknown_parent_columns_total",
+        "Gossip columns that came before their parent block, by what became of them",
+        &["event"],
+        default_registry()
+    ).expect("failed to create BEACON_UNKNOWN_PARENT_COLUMNS_TOTAL int counter vec");
+
+    pub static ref BEACON_UNSEEN_BLOCK_LOOKUPS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_unseen_block_lookups_total",
+        "Block roots that signed gossip referred to before the block came, by source and outcome",
+        &["source", "outcome"],
+        default_registry()
+    ).expect("failed to create BEACON_UNSEEN_BLOCK_LOOKUPS_TOTAL int counter vec");
+
+    pub static ref BEACON_EXECUTION_COLUMN_FETCHES_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!(
+        "beacon_execution_column_fetches_total",
+        "Column fetches from the execution client's blobs, by what started them",
+        &["trigger"],
+        default_registry()
+    ).expect("failed to create BEACON_EXECUTION_COLUMN_FETCHES_TOTAL int counter vec");
+
     pub static ref BEACON_DATA_COLUMN_FETCH_ENTRIES: IntGaugeVec = register_int_gauge_vec_with_registry!(
         "beacon_data_column_fetch_entries",
         "Current number of data column fetch entries by state",

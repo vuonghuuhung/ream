@@ -16,6 +16,8 @@ pub enum ColumnSource {
     ByRoot,
     ExecutionLayer,
     Reconstructed,
+    /// Came over gossip before its parent block and was kept until the parent came.
+    Replayed,
 }
 
 impl ColumnSource {
@@ -25,6 +27,7 @@ impl ColumnSource {
             ColumnSource::ByRoot => "by_root",
             ColumnSource::ExecutionLayer => "el",
             ColumnSource::Reconstructed => "reconstructed",
+            ColumnSource::Replayed => "replayed",
         }
     }
 }
@@ -62,6 +65,21 @@ pub fn log_columns_received(
         source.as_str(),
         peer.map_or_else(|| "none".to_string(), PeerId::to_string),
         indices.join(","),
+        into_slot_ms(genesis_time, slot),
+    );
+}
+
+/// Logs a lookup of `block_root`, a block of `slot` that gossip from `source` referred to before
+/// the block came.
+pub fn log_unseen_block_lookup(
+    genesis_time: u64,
+    slot: u64,
+    block_root: alloy_primitives::B256,
+    source: &str,
+) {
+    debug!(
+        target: "ream::timing",
+        "timing: unseen block lookup slot={slot} root={block_root} source={source} into_slot_ms={}",
         into_slot_ms(genesis_time, slot),
     );
 }

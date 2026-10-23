@@ -258,9 +258,10 @@ async fn validate_data_column_sidecar_full_inner(
             pending_availability,
         }) = parent
         else {
-            return Ok(ValidationResult::Ignore(
-                "Parent block not seen".to_string(),
-            ));
+            // Gossip IGNOREs it, but the caller may keep it until the parent comes.
+            return Ok(ValidationResult::UnknownParent {
+                parent_root: header.parent_root,
+            });
         };
 
         if header.slot <= block_slot {

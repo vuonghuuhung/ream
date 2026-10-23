@@ -138,6 +138,8 @@ struct LookupEntry<BlockPayload, Peer> {
     failed_downloads: u8,
     failed_processing: u8,
     created_at: Instant,
+    /// Looked up for itself rather than as a child's parent, so it is kept without children.
+    requested: bool,
 }
 
 impl<BlockPayload, Peer: Eq> LookupEntry<BlockPayload, Peer> {
@@ -242,6 +244,7 @@ where
                 failed_downloads: 0,
                 failed_processing: 0,
                 created_at: now,
+                requested: false,
             });
         entry.add_peer(peer.clone(), max_peers);
         entry.meta = Some(meta);
@@ -254,6 +257,26 @@ where
 
         self.insert_child(meta.parent_root, meta.block_root);
         self.ensure_parent_lookup(meta.parent_root, peer, now);
+        InsertOutcome::Inserted
+    }
+
+    /// Downloads `block_root`, a block that signed gossip refers to but that has not arrived.
+    pub fn insert_block_root(&mut self, block_root: B256, peer: Peer) -> InsertOutcome {
+        self.prune_failed_roots();
+        if self.failed_roots.contains_key(&block_root) {
+            return InsertOutcome::Rejected(InsertError::RecentlyFailed);
+        }
+        if self.entries.contains_key(&block_root) {
+            self.add_peer_to_chain(block_root, peer);
+            return InsertOutcome::Duplicate;
+        }
+        if self.entries.len() >= self.config.max_lookups {
+            return InsertOutcome::Rejected(InsertError::Capacity);
+        }
+        self.ensure_parent_lookup(block_root, peer, Instant::now());
+        if let Some(entry) = self.entries.get_mut(&block_root) {
+            entry.requested = true;
+        }
         InsertOutcome::Inserted
     }
 
@@ -374,7 +397,12 @@ where
             .get_mut(&block_root)
             .expect("matched lookup must exist");
         entry.failed_downloads = entry.failed_downloads.saturating_add(1);
-        if entry.failed_downloads >= self.config.max_attempts {
+        let requested_alone = entry.requested && !self.children_by_parent.contains_key(&block_root);
+        if entry.failed_downloads >= self.config.max_attempts && requested_alone {
+            // Peers may not have the block yet. Marking it failed would refuse its children's
+            // lookups for a minute.
+            self.discard_subtree(block_root);
+        } else if entry.failed_downloads >= self.config.max_attempts {
             self.drop_subtree(block_root);
         } else {
             entry.state = LookupState::AwaitingDownload;
@@ -645,6 +673,7 @@ where
                         failed_downloads: 0,
                         failed_processing: 0,
                         created_at: now,
+                        requested: false,
                     },
                 );
                 self.pending_actions
@@ -813,6 +842,7 @@ where
         loop {
             let orphan = self.entries.iter().find_map(|(root, entry)| {
                 (entry.meta.is_none()
+                    && !entry.requested
                     && self
                         .children_by_parent
                         .get(root)
@@ -952,6 +982,61 @@ mod tests {
         assert_eq!(
             coordinator.insert_gossip_block(meta(4, 3, 4), 40, 8),
             InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn a_requested_root_is_downloaded_and_processed_without_children() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        assert_eq!(
+            coordinator.insert_block_root(root(2), 7),
+            InsertOutcome::Inserted
+        );
+        // Cleanup after another import must not drop it for having no children.
+        coordinator.block_imported(root(5));
+        assert!(coordinator.contains(&root(2)));
+
+        let (action_id, requested, peer) = request_action(&mut coordinator);
+        assert_eq!((requested, peer), (root(2), 7));
+        assert_eq!(
+            coordinator.download_succeeded(action_id, meta(2, 1, 2), 20, ParentStatus::Imported),
+            Ok(true)
+        );
+        let (action_id, meta, origin, payload) = process_action(&mut coordinator);
+        assert_eq!(
+            (meta.block_root, origin, payload),
+            (root(2), PayloadOrigin::Rpc, 20)
+        );
+        assert!(coordinator.process_imported(action_id, root(2)));
+        assert!(!coordinator.contains(&root(2)));
+    }
+
+    #[test]
+    fn a_requested_root_that_no_peer_serves_does_not_block_its_children() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        coordinator.insert_block_root(root(2), 7);
+        for _ in 0..config().max_attempts {
+            let (action_id, requested, _) = request_action(&mut coordinator);
+            assert!(coordinator.download_failed(action_id, requested));
+        }
+        assert!(coordinator.is_empty());
+        assert_eq!(
+            coordinator.insert_gossip_block(meta(3, 2, 3), 30, 8),
+            InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn a_requested_root_that_is_already_looked_up_is_a_duplicate() {
+        let mut coordinator = UnknownParentLookupCoordinator::new(config());
+        coordinator.insert_gossip_block(meta(2, 1, 2), 20, 7);
+        assert_eq!(
+            coordinator.insert_block_root(root(1), 8),
+            InsertOutcome::Duplicate
+        );
+        assert_eq!(
+            coordinator.insert_block_root(root(2), 8),
+            InsertOutcome::Duplicate
         );
     }
 

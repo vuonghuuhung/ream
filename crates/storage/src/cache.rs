@@ -263,6 +263,8 @@ pub struct BeaconCacheDB {
     pub validated_data_column_headers: RwLock<LruCache<B256, ValidatedDataColumnHeader>>,
     /// Per-header locks so a block's columns run the header checks once.
     pub data_column_header_locks: Mutex<HashMap<B256, Arc<tokio::sync::Mutex<()>>>>,
+    /// Unseen block roots already reported for a lookup, so a block's messages report it once.
+    pub hinted_block_roots: RwLock<LruCache<B256, ()>>,
     pub seen_attestations: RwLock<LruCache<AtestationKey, ()>>,
     pub seen_bls_to_execution_change: RwLock<LruCache<AddressValidaterIndexIdentifier, ()>>,
     pub seen_sync_messages: RwLock<LruCache<SyncCommitteeKey, ()>>,
@@ -351,6 +353,10 @@ impl BeaconCacheDB {
             )
             .into(),
             data_column_header_locks: Mutex::new(HashMap::new()),
+            hinted_block_roots: LruCache::new(
+                NonZeroUsize::new(LRU_CACHE_SIZE).expect("Invalid cache size"),
+            )
+            .into(),
             seen_attestations: LruCache::new(
                 NonZeroUsize::new(LRU_CACHE_SIZE).expect("Invalid cache size"),
             )

@@ -19,6 +19,9 @@ use super::result::ValidationResult;
 
 const GOSSIP_ATTESTATION_SYNC_TOLERANCE: u64 = 2 * SLOTS_PER_EPOCH;
 
+/// Why an attestation for a block the node has not seen is ignored.
+pub const UNSEEN_BLOCK_REASON: &str = "The block being voted for has not been seen";
+
 fn is_too_far_behind_to_validate(head_slot: u64, attestation_slot: u64) -> bool {
     attestation_slot.saturating_sub(head_slot) > GOSSIP_ATTESTATION_SYNC_TOLERANCE
 }
@@ -149,9 +152,7 @@ pub async fn validate_beacon_attestation(
         .block_provider()
         .contains_key(attestation.data.beacon_block_root)?
     {
-        return Ok(ValidationResult::Ignore(
-            "The block being voted for has not been seen".to_string(),
-        ));
+        return Ok(ValidationResult::Ignore(UNSEEN_BLOCK_REASON.to_string()));
     }
 
     // [REJECT] The block being voted for (aggregate.data.beacon_block_root) passes validation.
@@ -184,19 +185,7 @@ pub async fn validate_beacon_attestation(
     }
 
     // [REJECT] The signature of attestation is valid.
-    let validator = state
-        .validators
-        .get(attestation.attester_index as usize)
-        .ok_or_else(|| anyhow!("Could not get validator"))?;
-
-    let domain = state.get_domain(DOMAIN_BEACON_ATTESTER, Some(attestation.data.target.epoch));
-    let signing_root = compute_signing_root(&attestation.data, domain);
-
-    let signature_valid = attestation
-        .signature
-        .verify(&validator.public_key, signing_root.as_slice())?;
-
-    if !signature_valid {
+    if !attestation_signature_is_valid(state, attestation)? {
         return Ok(ValidationResult::Reject(
             "Invalid attestation signature".to_string(),
         ));
@@ -208,6 +197,22 @@ pub async fn validate_beacon_attestation(
         ));
     }
     Ok(ValidationResult::Accept)
+}
+
+/// Whether `attestation` is signed by its attester, whose committee `state` determines.
+pub fn attestation_signature_is_valid(
+    state: &BeaconState,
+    attestation: &SingleAttestation,
+) -> anyhow::Result<bool> {
+    let validator = state
+        .validators
+        .get(attestation.attester_index as usize)
+        .ok_or_else(|| anyhow!("Could not get validator"))?;
+    let domain = state.get_domain(DOMAIN_BEACON_ATTESTER, Some(attestation.data.target.epoch));
+    let signing_root = compute_signing_root(&attestation.data, domain);
+    Ok(attestation
+        .signature
+        .verify(&validator.public_key, signing_root.as_slice())?)
 }
 
 #[cfg(test)]

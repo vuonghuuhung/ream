@@ -38,8 +38,9 @@ use ream_network_manager::{
         apply_coordinator_update, execute_coordinator_action, insert_pending_item,
     },
     data_availability_fetch::{ColumnFetchOutcome, fetch_missing_columns},
+    gossip_hint::{GossipHint, UnknownParentColumns, UnseenBlockSource},
     gossipsub::{
-        handle::{Message, MessageAcceptance, handle_gossipsub_message},
+        handle::{Message, MessageAcceptance, handle_data_column, handle_gossipsub_message},
         validate::{
             data_column_sidecar::{GossipValidatedDataColumn, validate_data_column_sidecar_full},
             result::DependencyValidationResult,
@@ -47,6 +48,7 @@ use ream_network_manager::{
     },
     p2p_sender::P2PSender,
     service::NetworkManagerService,
+    timing::ColumnSource,
     unknown_parent_lookup::{
         BlocksByRootRefusals, apply_unknown_parent_update, spawn_unknown_parent_action,
     },
@@ -299,6 +301,7 @@ impl GossipLookupHarness {
             &self.cached_db,
             &mut pending_item,
             &mut unknown_parent_block,
+            &mut Vec::new(),
             libp2p::PeerId::random(),
             |_| {},
         )
@@ -1279,6 +1282,94 @@ async fn test_finality_advance_before_column_release_does_not_import_pending_chi
 
 #[tokio::test]
 #[serial]
+async fn test_a_column_that_comes_before_its_parent_is_kept_and_completes_the_child() {
+    let (mut harness, genesis_state, genesis_block) =
+        GossipLookupHarness::new("column_before_parent").await;
+    harness.wait_for_slot(2).await;
+    let parent = build_blob_block(&genesis_state, &genesis_block, 1, None, 51).await;
+    let child = build_blob_block(
+        parent
+            .post_state
+            .as_ref()
+            .expect("valid parent should have post-state"),
+        &parent.signed_block,
+        2,
+        None,
+        52,
+    )
+    .await;
+    let parent_root = parent.signed_block.message.tree_hash_root();
+    let child_root = child.signed_block.message.tree_hash_root();
+    let peer = libp2p::PeerId::random();
+
+    // The child's column comes first: gossip IGNOREs it, and it is handed back to keep.
+    let mut pending_item = None;
+    let mut hints = Vec::new();
+    let acceptance = handle_data_column(
+        Box::new(child.column.clone()),
+        child.column.compute_subnet(),
+        &harness.beacon_chain,
+        &harness.cached_db,
+        &mut pending_item,
+        &mut hints,
+        peer,
+        ColumnSource::Gossip,
+    )
+    .await;
+    assert!(matches!(acceptance, MessageAcceptance::Ignore));
+    assert!(pending_item.is_none());
+    let [
+        GossipHint::UnseenBlock(unseen),
+        GossipHint::UnknownParentColumn { column, .. },
+    ] = hints.as_slice()
+    else {
+        panic!("expected a parent lookup hint and the column to keep, got {hints:?}");
+    };
+    assert_eq!(
+        (unseen.block_root, unseen.source),
+        (parent_root, UnseenBlockSource::ChildColumn)
+    );
+    let mut kept = UnknownParentColumns::default();
+    kept.insert(*column.clone(), peer, 2);
+
+    assert!(matches!(
+        harness
+            .beacon_chain
+            .process_block(parent.signed_block.clone())
+            .await,
+        Ok(BlockProcessingOutcome::PendingAvailability { .. })
+    ));
+    harness.deliver_column(&parent.column).await;
+    harness.assert_imported(parent_root).await;
+
+    // Released with its parent, the kept column completes the child without a fetch.
+    let released = kept.take(parent_root);
+    assert_eq!(released.len(), 1);
+    let (column, peer) = released.into_iter().next().expect("one column was kept");
+    let acceptance = handle_data_column(
+        Box::new(column),
+        child.column.compute_subnet(),
+        &harness.beacon_chain,
+        &harness.cached_db,
+        &mut pending_item,
+        &mut Vec::new(),
+        peer,
+        ColumnSource::Replayed,
+    )
+    .await;
+    assert!(matches!(acceptance, MessageAcceptance::Accept));
+    assert!(matches!(
+        harness
+            .beacon_chain
+            .process_block(child.signed_block.clone())
+            .await,
+        Ok(BlockProcessingOutcome::Imported { .. })
+    ));
+    harness.assert_imported(child_root).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn test_unknown_parent_block_imports_after_parent_arrives() {
     let (mut harness, genesis_state, genesis_block) =
         GossipLookupHarness::new_with_forced_data_availability("unknown_parent_lookup", true).await;
@@ -1320,6 +1411,7 @@ async fn test_unknown_parent_block_imports_after_parent_arrives() {
         &harness.cached_db,
         &mut pending_item,
         &mut unknown_parent_block,
+        &mut Vec::new(),
         libp2p::PeerId::random(),
         |_| {},
     )
